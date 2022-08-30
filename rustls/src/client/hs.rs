@@ -85,6 +85,8 @@ pub(super) fn start_handshake(
     extra_exts: Vec<ClientExtension>,
     config: Arc<ClientConfig>,
     cx: &mut ClientContext<'_>,
+    random: Option<Random>,
+    session_id: Option<SessionID>,
 ) -> NextStateOrError {
     let mut transcript_buffer = HandshakeHashBuffer::new();
     if config
@@ -96,7 +98,7 @@ pub(super) fn start_handshake(
 
     let support_tls13 = config.supports_version(ProtocolVersion::TLSv1_3);
 
-    let mut session_id: Option<SessionID> = None;
+    let mut session_id: Option<SessionID> = session_id;
     let mut resuming_session = find_session(
         &server_name,
         &config,
@@ -110,21 +112,23 @@ pub(super) fn start_handshake(
         None
     };
 
-    if let Some(_resuming) = &mut resuming_session {
-        #[cfg(feature = "tls12")]
-        if let persist::ClientSessionValue::Tls12(inner) = &mut _resuming.value {
-            // If we have a ticket, we use the sessionid as a signal that
-            // we're  doing an abbreviated handshake.  See section 3.4 in
-            // RFC5077.
-            if !inner.ticket().is_empty() {
-                inner.session_id = SessionID::random()?;
+    if session_id.is_none() {
+        if let Some(_resuming) = &mut resuming_session {
+            #[cfg(feature = "tls12")]
+            if let persist::ClientSessionValue::Tls12(inner) = &mut _resuming.value {
+                // If we have a ticket, we use the sessionid as a signal that
+                // we're  doing an abbreviated handshake.  See section 3.4 in
+                // RFC5077.
+                if !inner.ticket().is_empty() {
+                    inner.session_id = SessionID::random()?;
+                }
+                session_id = Some(inner.session_id);
             }
-            session_id = Some(inner.session_id);
-        }
 
-        debug!("Resuming session");
-    } else {
-        debug!("Not resuming any session");
+            debug!("Resuming session");
+        } else {
+            debug!("Not resuming any session");
+        }
     }
 
     // https://tools.ietf.org/html/rfc8446#appendix-D.4
@@ -133,7 +137,9 @@ pub(super) fn start_handshake(
         session_id = Some(SessionID::random()?);
     }
 
-    let random = Random::new()?;
+    let random = random
+        .ok_or(())
+        .or_else(|_| Random::new())?;
     let hello_details = ClientHelloDetails::new();
     let sent_tls13_fake_ccs = false;
     let may_send_sct_list = config.verifier.request_scts();

@@ -7,7 +7,7 @@ use crate::kx::SupportedKxGroup;
 use crate::log::trace;
 #[cfg(feature = "quic")]
 use crate::msgs::enums::AlertDescription;
-use crate::msgs::handshake::ClientExtension;
+use crate::msgs::handshake::{ClientExtension, Random, SessionID};
 use crate::sign;
 use crate::suites::SupportedCipherSuite;
 use crate::verify;
@@ -443,7 +443,24 @@ impl ClientConnection {
     /// we behave in the TLS protocol, `name` is the
     /// name of the server we want to talk to.
     pub fn new(config: Arc<ClientConfig>, name: ServerName) -> Result<Self, Error> {
-        Self::new_inner(config, name, Vec::new(), Protocol::Tcp)
+        Self::new_inner(config, name, Vec::new(), Protocol::Tcp, None, None)
+    }
+
+    /// [`new`](#method.new) with the specified random and session_id.
+    pub fn new_with_random_and_session_id(
+        config: Arc<ClientConfig>,
+        name: ServerName,
+        random: Random,
+        session_id: SessionID,
+    ) -> Result<Self, Error> {
+        Self::new_inner(
+            config,
+            name,
+            Vec::new(),
+            Protocol::Tcp,
+            Some(random),
+            Some(session_id),
+        )
     }
 
     fn new_inner(
@@ -451,6 +468,8 @@ impl ClientConnection {
         name: ServerName,
         extra_exts: Vec<ClientExtension>,
         proto: Protocol,
+        random: Option<Random>,
+        session_id: Option<SessionID>,
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
@@ -462,7 +481,7 @@ impl ClientConnection {
             data: &mut data,
         };
 
-        let state = hs::start_handshake(name, extra_exts, config, &mut cx)?;
+        let state = hs::start_handshake(name, extra_exts, config, &mut cx, random, session_id)?;
         let inner = ConnectionCommon::new(state, data, common_state);
 
         Ok(Self { inner })

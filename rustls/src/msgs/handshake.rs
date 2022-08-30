@@ -15,6 +15,7 @@ use crate::rand;
 use crate::log::warn;
 
 use std::collections;
+use std::convert::TryInto;
 use std::fmt;
 
 macro_rules! declare_u8_vec(
@@ -106,6 +107,24 @@ impl From<[u8; 32]> for Random {
 pub struct SessionID {
     len: usize,
     data: [u8; 32],
+}
+
+impl From<&[u8]> for SessionID {
+    fn from(s: &[u8]) -> Self {
+        if s.len() > 32 {
+            panic!();
+        }
+        Self {
+            len: s.len(),
+            data: s.try_into().unwrap(),
+        }
+    }
+}
+
+impl Into<(usize, [u8; 32])> for SessionID {
+    fn into(self) -> (usize, [u8; 32]) {
+        (self.len, self.data)
+    }
 }
 
 impl fmt::Debug for SessionID {

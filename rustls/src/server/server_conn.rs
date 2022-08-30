@@ -629,6 +629,11 @@ impl Accepted {
             _ => unreachable!(),
         }
     }
+
+    /// Get the inner [`ClientHelloPayload`] of the handshake.
+    pub fn get_client_hello_payload(&self) -> &ClientHelloPayload {
+        Self::client_hello_payload(&self.message)
+    }
 }
 
 struct Accepting;
