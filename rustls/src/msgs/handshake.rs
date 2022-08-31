@@ -15,7 +15,7 @@ use crate::rand;
 use crate::log::warn;
 
 use std::collections;
-use std::convert::TryInto;
+
 use std::fmt;
 
 macro_rules! declare_u8_vec(
@@ -114,13 +114,13 @@ impl From<&[u8]> for SessionID {
         if s.len() > 32 {
             panic!();
         }
-        Self {
-            len: s.len(),
-            data: s.try_into().unwrap(),
-        }
+        let mut data = [0u8; 32];
+        data[..s.len()].copy_from_slice(s);
+        Self { len: s.len(), data }
     }
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<(usize, [u8; 32])> for SessionID {
     fn into(self) -> (usize, [u8; 32]) {
         (self.len, self.data)
