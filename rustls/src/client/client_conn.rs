@@ -8,6 +8,7 @@ use crate::log::trace;
 #[cfg(feature = "quic")]
 use crate::msgs::enums::AlertDescription;
 use crate::msgs::handshake::{ClientExtension, Random, SessionID};
+use crate::msgs::message::Message;
 use crate::sign;
 use crate::suites::SupportedCipherSuite;
 use crate::verify;
@@ -443,15 +444,25 @@ impl ClientConnection {
     /// we behave in the TLS protocol, `name` is the
     /// name of the server we want to talk to.
     pub fn new(config: Arc<ClientConfig>, name: ServerName) -> Result<Self, Error> {
-        Self::new_inner(config, name, Vec::new(), Protocol::Tcp, None, None)
+        Self::new_inner(
+            config,
+            name,
+            Vec::new(),
+            Protocol::Tcp,
+            None,
+            None,
+            None::<fn(&mut Message)>,
+        )
     }
 
-    /// [`new`](#method.new) with the specified random and session_id.
-    pub fn new_with_random_and_session_id(
+    /// [`new`](#method.new) with the specified random, session_id and a function to mutate
+    /// ClientHello message.
+    pub fn new_with(
         config: Arc<ClientConfig>,
         name: ServerName,
         random: Random,
         session_id: SessionID,
+        f: impl FnOnce(&mut Message),
     ) -> Result<Self, Error> {
         Self::new_inner(
             config,
@@ -460,6 +471,7 @@ impl ClientConnection {
             Protocol::Tcp,
             Some(random),
             Some(session_id),
+            Some(f),
         )
     }
 
@@ -470,6 +482,7 @@ impl ClientConnection {
         proto: Protocol,
         random: Option<Random>,
         session_id: Option<SessionID>,
+        f: Option<impl FnOnce(&mut Message)>,
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
@@ -481,7 +494,7 @@ impl ClientConnection {
             data: &mut data,
         };
 
-        let state = hs::start_handshake(name, extra_exts, config, &mut cx, random, session_id)?;
+        let state = hs::start_handshake(name, extra_exts, config, &mut cx, random, session_id, f)?;
         let inner = ConnectionCommon::new(state, data, common_state);
 
         Ok(Self { inner })

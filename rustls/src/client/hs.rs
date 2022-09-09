@@ -87,6 +87,7 @@ pub(super) fn start_handshake(
     cx: &mut ClientContext<'_>,
     random: Option<Random>,
     session_id: Option<SessionID>,
+    f: Option<impl FnOnce(&mut Message)>,
 ) -> NextStateOrError {
     let mut transcript_buffer = HandshakeHashBuffer::new();
     if config
@@ -159,6 +160,7 @@ pub(super) fn start_handshake(
         extra_exts,
         may_send_sct_list,
         None,
+        f,
     ))
 }
 
@@ -198,6 +200,7 @@ fn emit_client_hello_for_retry(
     extra_exts: Vec<ClientExtension>,
     may_send_sct_list: bool,
     suite: Option<SupportedCipherSuite>,
+    f: Option<impl FnOnce(&mut Message)>,
 ) -> NextState {
     // Do we have a SessionID or ticket cached for this host?
     let (ticket, resume_version) = if let Some(resuming) = &resuming_session {
@@ -362,7 +365,7 @@ fn emit_client_hello_for_retry(
         None
     };
 
-    let ch = Message {
+    let mut ch = Message {
         // "This value MUST be set to 0x0303 for all records generated
         //  by a TLS 1.3 implementation other than an initial ClientHello
         //  (i.e., one not generated after a HelloRetryRequest)"
@@ -373,6 +376,9 @@ fn emit_client_hello_for_retry(
         },
         payload: MessagePayload::handshake(chp),
     };
+    if let Some(f) = f {
+        f(&mut ch);
+    }
 
     if retryreq.is_some() {
         // send dummy CCS to fool middleboxes prior
@@ -790,6 +796,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
             self.extra_exts,
             may_send_sct_list,
             Some(cs),
+            None::<fn(&mut Message)>,
         ))
     }
 }
