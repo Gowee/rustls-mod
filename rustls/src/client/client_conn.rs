@@ -462,7 +462,7 @@ impl ClientConnection {
         name: ServerName,
         random: Random,
         session_id: SessionID,
-        f: impl FnOnce(&mut Message),
+        f: Option<impl FnOnce(&mut Message)>,
     ) -> Result<Self, Error> {
         Self::new_inner(
             config,
@@ -471,7 +471,7 @@ impl ClientConnection {
             Protocol::Tcp,
             Some(random),
             Some(session_id),
-            Some(f),
+            f,
         )
     }
 
