@@ -452,7 +452,7 @@ impl ClientConnection {
             Protocol::Tcp,
             None,
             None,
-            None::<fn(&mut Message) -> Vec<ExtensionType>>,
+            None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
         )
     }
 
@@ -463,7 +463,7 @@ impl ClientConnection {
         name: ServerName,
         random: Random,
         session_id: SessionID,
-        f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
+        f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
     ) -> Result<Self, Error> {
         Self::new_inner(
             config,
@@ -483,7 +483,7 @@ impl ClientConnection {
         proto: Protocol,
         random: Option<Random>,
         session_id: Option<SessionID>,
-        f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
+        f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
@@ -667,7 +667,7 @@ pub trait ClientQuicExt {
             Protocol::Quic,
             None,
             None,
-            None::<fn(&mut Message) -> Vec<ExtensionType>>,
+            None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
         )
     }
 }

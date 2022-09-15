@@ -87,7 +87,7 @@ pub(super) fn start_handshake(
     cx: &mut ClientContext<'_>,
     random: Option<Random>,
     session_id: Option<SessionID>,
-    f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
+    f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
 ) -> NextStateOrError {
     let mut transcript_buffer = HandshakeHashBuffer::new();
     if config
@@ -177,7 +177,7 @@ struct ExpectServerHello {
     session_id: SessionID,
     sent_tls13_fake_ccs: bool,
     suite: Option<SupportedCipherSuite>,
-    allowed_unsolicited_extensions: Vec<ExtensionType>,
+    allowed_unsolicited_extensions: Option<Vec<ExtensionType>>,
 }
 
 struct ExpectServerHelloOrHelloRetryRequest {
@@ -201,7 +201,7 @@ fn emit_client_hello_for_retry(
     extra_exts: Vec<ClientExtension>,
     may_send_sct_list: bool,
     suite: Option<SupportedCipherSuite>,
-    f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
+    f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
 ) -> NextState {
     // Do we have a SessionID or ticket cached for this host?
     let (ticket, resume_version) = if let Some(resuming) = &resuming_session {
@@ -377,7 +377,7 @@ fn emit_client_hello_for_retry(
         },
         payload: MessagePayload::handshake(chp),
     };
-    let mut allowed_unsolicited_extensions = vec![];
+    let mut allowed_unsolicited_extensions = None;
     if let Some(f) = f {
         allowed_unsolicited_extensions = f(&mut ch);
     }
@@ -545,7 +545,9 @@ impl State<ClientConnectionData> for ExpectServerHello {
         // let allowed_unsolicited = [ExtensionType::RenegotiationInfo]; PATCHED:
         let allowed_unsolicited = self
             .allowed_unsolicited_extensions
-            .as_slice();
+            .as_ref()
+            .map(|s| s.as_slice())
+            .unwrap_or(&[ExtensionType::RenegotiationInfo]);
         if self
             .hello
             .server_sent_unsolicited_extensions(&server_hello.extensions, &allowed_unsolicited)
@@ -802,7 +804,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
             self.extra_exts,
             may_send_sct_list,
             Some(cs),
-            None::<fn(&mut Message) -> Vec<ExtensionType>>,
+            None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
         ))
     }
 }
