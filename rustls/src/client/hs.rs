@@ -87,7 +87,7 @@ pub(super) fn start_handshake(
     cx: &mut ClientContext<'_>,
     random: Option<Random>,
     session_id: Option<SessionID>,
-    f: Option<impl FnOnce(&mut Message)>,
+    f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
 ) -> NextStateOrError {
     let mut transcript_buffer = HandshakeHashBuffer::new();
     if config
@@ -177,6 +177,7 @@ struct ExpectServerHello {
     session_id: SessionID,
     sent_tls13_fake_ccs: bool,
     suite: Option<SupportedCipherSuite>,
+    allowed_unsolicited_extensions: Vec<ExtensionType>,
 }
 
 struct ExpectServerHelloOrHelloRetryRequest {
@@ -200,7 +201,7 @@ fn emit_client_hello_for_retry(
     extra_exts: Vec<ClientExtension>,
     may_send_sct_list: bool,
     suite: Option<SupportedCipherSuite>,
-    f: Option<impl FnOnce(&mut Message)>,
+    f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
 ) -> NextState {
     // Do we have a SessionID or ticket cached for this host?
     let (ticket, resume_version) = if let Some(resuming) = &resuming_session {
@@ -376,8 +377,9 @@ fn emit_client_hello_for_retry(
         },
         payload: MessagePayload::handshake(chp),
     };
+    let mut allowed_unsolicited_extensions = vec![];
     if let Some(f) = f {
-        f(&mut ch);
+        allowed_unsolicited_extensions = f(&mut ch);
     }
 
     if retryreq.is_some() {
@@ -422,6 +424,7 @@ fn emit_client_hello_for_retry(
         session_id,
         sent_tls13_fake_ccs,
         suite,
+        allowed_unsolicited_extensions,
     };
 
     if support_tls13 && retryreq.is_none() {
@@ -539,7 +542,10 @@ impl State<ClientConnectionData> for ExpectServerHello {
             ));
         }
 
-        let allowed_unsolicited = [ExtensionType::RenegotiationInfo];
+        // let allowed_unsolicited = [ExtensionType::RenegotiationInfo]; PATCHED:
+        let allowed_unsolicited = self
+            .allowed_unsolicited_extensions
+            .as_slice();
         if self
             .hello
             .server_sent_unsolicited_extensions(&server_hello.extensions, &allowed_unsolicited)
@@ -796,7 +802,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
             self.extra_exts,
             may_send_sct_list,
             Some(cs),
-            None::<fn(&mut Message)>,
+            None::<fn(&mut Message) -> Vec<ExtensionType>>,
         ))
     }
 }

@@ -7,6 +7,7 @@ use crate::kx::SupportedKxGroup;
 use crate::log::trace;
 #[cfg(feature = "quic")]
 use crate::msgs::enums::AlertDescription;
+use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{ClientExtension, Random, SessionID};
 use crate::msgs::message::Message;
 use crate::sign;
@@ -451,18 +452,18 @@ impl ClientConnection {
             Protocol::Tcp,
             None,
             None,
-            None::<fn(&mut Message)>,
+            None::<fn(&mut Message) -> Vec<ExtensionType>>,
         )
     }
 
-    /// [`new`](#method.new) with the specified random, session_id and a function to mutate
-    /// ClientHello message.
+    /// Patched [`new`](#method.new) with the specified random, session_id and a function to mutate
+    /// ClientHello message which returns a list of allowed unsolicited extensions.
     pub fn new_with(
         config: Arc<ClientConfig>,
         name: ServerName,
         random: Random,
         session_id: SessionID,
-        f: Option<impl FnOnce(&mut Message)>,
+        f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
     ) -> Result<Self, Error> {
         Self::new_inner(
             config,
@@ -482,7 +483,7 @@ impl ClientConnection {
         proto: Protocol,
         random: Option<Random>,
         session_id: Option<SessionID>,
-        f: Option<impl FnOnce(&mut Message)>,
+        f: Option<impl FnOnce(&mut Message) -> Vec<ExtensionType>>,
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
@@ -659,7 +660,15 @@ pub trait ClientQuicExt {
             quic::Version::V1 => ClientExtension::TransportParameters(params),
         };
 
-        ClientConnection::new_inner(config, name, vec![ext], Protocol::Quic)
+        ClientConnection::new_inner(
+            config,
+            name,
+            vec![ext],
+            Protocol::Quic,
+            None,
+            None,
+            None::<fn(&mut Message) -> Vec<ExtensionType>>,
+        )
     }
 }
 
