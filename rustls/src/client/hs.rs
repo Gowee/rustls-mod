@@ -87,6 +87,7 @@ pub(super) fn start_handshake(
     cx: &mut ClientContext<'_>,
     random: Option<Random>,
     session_id: Option<SessionID>,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
     f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
 ) -> NextStateOrError {
     let mut transcript_buffer = HandshakeHashBuffer::new();
@@ -108,7 +109,16 @@ pub(super) fn start_handshake(
     );
 
     let key_share = if support_tls13 {
-        Some(tls13::initial_key_share(&config, &server_name)?)
+        if let Some((group, key)) = fixed_kxkey {
+            Some(tls13::initial_key_share_fixed(
+                &config,
+                &server_name,
+                group,
+                key,
+            )?)
+        } else {
+            Some(tls13::initial_key_share(&config, &server_name)?)
+        }
     } else {
         None
     };
@@ -544,13 +554,11 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         // let allowed_unsolicited = [ExtensionType::RenegotiationInfo]; PATCHED:
         let allowed_unsolicited = self
-            .allowed_unsolicited_extensions
-            .as_ref()
-            .map(|s| s.as_slice())
+            .allowed_unsolicited_extensions.as_deref()
             .unwrap_or(&[ExtensionType::RenegotiationInfo]);
         if self
             .hello
-            .server_sent_unsolicited_extensions(&server_hello.extensions, &allowed_unsolicited)
+            .server_sent_unsolicited_extensions(&server_hello.extensions, allowed_unsolicited)
         {
             cx.common
                 .send_fatal_alert(AlertDescription::UnsupportedExtension);

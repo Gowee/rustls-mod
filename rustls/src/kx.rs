@@ -40,6 +40,19 @@ impl KeyExchange {
         })
     }
 
+    pub(crate) fn start_fixed(
+        skxg: &'static SupportedKxGroup,
+        ours: ring::agreement::EphemeralPrivateKey,
+    ) -> Option<Self> {
+        let pubkey = ours.compute_public_key().ok()?;
+
+        Some(Self {
+            skxg,
+            privkey: ours,
+            pubkey,
+        })
+    }
+
     /// Return the group being used.
     pub(crate) fn group(&self) -> NamedGroup {
         self.skxg.name

@@ -221,6 +221,19 @@ pub(super) fn initial_key_share(
     kx::KeyExchange::start(group).ok_or(Error::FailedToGetRandomBytes)
 }
 
+pub(super) fn initial_key_share_fixed(
+    _config: &ClientConfig,
+    _server_name: &ServerName,
+    group: NamedGroup,
+    fixed_key: ring::agreement::EphemeralPrivateKey,
+) -> Result<kx::KeyExchange, Error> {
+    kx::KeyExchange::start_fixed(
+        kx::KeyExchange::choose(group, &kx::ALL_KX_GROUPS).expect("Kx groups not supported"),
+        fixed_key,
+    )
+    .ok_or(Error::FailedToGetRandomBytes)
+}
+
 fn save_kx_hint(config: &ClientConfig, server_name: &ServerName, group: NamedGroup) {
     let key = persist::ClientSessionKey::hint_for_server_name(server_name);
 

@@ -452,6 +452,7 @@ impl ClientConnection {
             Protocol::Tcp,
             None,
             None,
+            None,
             None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
         )
     }
@@ -462,7 +463,8 @@ impl ClientConnection {
         config: Arc<ClientConfig>,
         name: ServerName,
         random: Random,
-        session_id: SessionID,
+        session_id: Option<SessionID>,
+        fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
         f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
     ) -> Result<Self, Error> {
         Self::new_inner(
@@ -471,7 +473,8 @@ impl ClientConnection {
             Vec::new(),
             Protocol::Tcp,
             Some(random),
-            Some(session_id),
+            session_id,
+            fixed_kxkey,
             f,
         )
     }
@@ -483,6 +486,7 @@ impl ClientConnection {
         proto: Protocol,
         random: Option<Random>,
         session_id: Option<SessionID>,
+        fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
         f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
@@ -495,7 +499,16 @@ impl ClientConnection {
             data: &mut data,
         };
 
-        let state = hs::start_handshake(name, extra_exts, config, &mut cx, random, session_id, f)?;
+        let state = hs::start_handshake(
+            name,
+            extra_exts,
+            config,
+            &mut cx,
+            random,
+            session_id,
+            fixed_kxkey,
+            f,
+        )?;
         let inner = ConnectionCommon::new(state, data, common_state);
 
         Ok(Self { inner })
@@ -665,6 +678,7 @@ pub trait ClientQuicExt {
             name,
             vec![ext],
             Protocol::Quic,
+            None,
             None,
             None,
             None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
