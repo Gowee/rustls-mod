@@ -453,6 +453,7 @@ impl ClientConnection {
             None,
             None,
             None,
+            None,
             None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
         )
     }
@@ -464,6 +465,7 @@ impl ClientConnection {
         name: ServerName,
         random: Random,
         session_id: Option<SessionID>,
+        fixed_kskey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
         fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
         f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
     ) -> Result<Self, Error> {
@@ -474,6 +476,7 @@ impl ClientConnection {
             Protocol::Tcp,
             Some(random),
             session_id,
+            fixed_kskey,
             fixed_kxkey,
             f,
         )
@@ -486,6 +489,7 @@ impl ClientConnection {
         proto: Protocol,
         random: Option<Random>,
         session_id: Option<SessionID>,
+        fixed_kskey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
         fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
         f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
     ) -> Result<Self, Error> {
@@ -506,6 +510,7 @@ impl ClientConnection {
             &mut cx,
             random,
             session_id,
+            fixed_kskey,
             fixed_kxkey,
             f,
         )?;
@@ -678,6 +683,7 @@ pub trait ClientQuicExt {
             name,
             vec![ext],
             Protocol::Quic,
+            None,
             None,
             None,
             None,

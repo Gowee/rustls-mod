@@ -4,7 +4,7 @@ use crate::enums::ProtocolVersion;
 use crate::error::Error;
 use crate::hash_hs::HandshakeHash;
 #[cfg(feature = "logging")]
-use crate::log::{debug, trace};
+use crate::log::{debug, trace, warn};
 use crate::msgs::base::{Payload, PayloadU8};
 use crate::msgs::ccs::ChangeCipherSpecPayload;
 use crate::msgs::codec::Codec;
@@ -49,6 +49,8 @@ mod server_hello {
         pub(in crate::client) randoms: ConnectionRandoms,
         pub(in crate::client) using_ems: bool,
         pub(in crate::client) transcript: HandshakeHash,
+        pub(in crate::client) fixed_kxkey:
+            Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
     }
 
     impl CompleteServerHelloHandling {
@@ -186,6 +188,7 @@ mod server_hello {
                 may_send_cert_status,
                 must_issue_new_ticket,
                 server_cert_sct_list,
+                fixed_kxkey: self.fixed_kxkey,
             }))
         }
     }
@@ -203,6 +206,7 @@ struct ExpectCertificate {
     may_send_cert_status: bool,
     must_issue_new_ticket: bool,
     server_cert_sct_list: Option<SCTList>,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificate {
@@ -231,6 +235,7 @@ impl State<ClientConnectionData> for ExpectCertificate {
                 server_cert_sct_list: self.server_cert_sct_list,
                 server_cert_chain,
                 must_issue_new_ticket: self.must_issue_new_ticket,
+                fixed_kxkey: self.fixed_kxkey,
             }))
         } else {
             let server_cert =
@@ -247,6 +252,7 @@ impl State<ClientConnectionData> for ExpectCertificate {
                 suite: self.suite,
                 server_cert,
                 must_issue_new_ticket: self.must_issue_new_ticket,
+                fixed_kxkey: self.fixed_kxkey,
             }))
         }
     }
@@ -264,6 +270,7 @@ struct ExpectCertificateStatusOrServerKx {
     server_cert_sct_list: Option<SCTList>,
     server_cert_chain: CertificatePayload,
     must_issue_new_ticket: bool,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateStatusOrServerKx {
@@ -291,6 +298,7 @@ impl State<ClientConnectionData> for ExpectCertificateStatusOrServerKx {
                     self.server_cert_sct_list,
                 ),
                 must_issue_new_ticket: self.must_issue_new_ticket,
+                fixed_kxkey: self.fixed_kxkey,
             })
             .handle(cx, m),
             MessagePayload::Handshake {
@@ -312,6 +320,7 @@ impl State<ClientConnectionData> for ExpectCertificateStatusOrServerKx {
                 server_cert_sct_list: self.server_cert_sct_list,
                 server_cert_chain: self.server_cert_chain,
                 must_issue_new_ticket: self.must_issue_new_ticket,
+                fixed_kxkey: self.fixed_kxkey,
             })
             .handle(cx, m),
             payload => Err(inappropriate_handshake_message(
@@ -338,6 +347,7 @@ struct ExpectCertificateStatus {
     server_cert_sct_list: Option<SCTList>,
     server_cert_chain: CertificatePayload,
     must_issue_new_ticket: bool,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateStatus {
@@ -376,6 +386,7 @@ impl State<ClientConnectionData> for ExpectCertificateStatus {
             suite: self.suite,
             server_cert,
             must_issue_new_ticket: self.must_issue_new_ticket,
+            fixed_kxkey: self.fixed_kxkey,
         }))
     }
 }
@@ -391,6 +402,7 @@ struct ExpectServerKx {
     suite: &'static Tls12CipherSuite,
     server_cert: ServerCertDetails,
     must_issue_new_ticket: bool,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 impl State<ClientConnectionData> for ExpectServerKx {
@@ -432,6 +444,7 @@ impl State<ClientConnectionData> for ExpectServerKx {
             server_cert: self.server_cert,
             server_kx,
             must_issue_new_ticket: self.must_issue_new_ticket,
+            fixed_kxkey: self.fixed_kxkey,
         }))
     }
 }
@@ -556,6 +569,7 @@ struct ExpectServerDoneOrCertReq {
     server_cert: ServerCertDetails,
     server_kx: ServerKxDetails,
     must_issue_new_ticket: bool,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 impl State<ClientConnectionData> for ExpectServerDoneOrCertReq {
@@ -582,6 +596,7 @@ impl State<ClientConnectionData> for ExpectServerDoneOrCertReq {
                 server_cert: self.server_cert,
                 server_kx: self.server_kx,
                 must_issue_new_ticket: self.must_issue_new_ticket,
+                fixed_kxkey: self.fixed_kxkey,
             })
             .handle(cx, m)
         } else {
@@ -600,6 +615,7 @@ impl State<ClientConnectionData> for ExpectServerDoneOrCertReq {
                 server_kx: self.server_kx,
                 client_auth: None,
                 must_issue_new_ticket: self.must_issue_new_ticket,
+                fixed_kxkey: self.fixed_kxkey,
             })
             .handle(cx, m)
         }
@@ -618,6 +634,7 @@ struct ExpectCertificateRequest {
     server_cert: ServerCertDetails,
     server_kx: ServerKxDetails,
     must_issue_new_ticket: bool,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateRequest {
@@ -663,6 +680,7 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
             server_kx: self.server_kx,
             client_auth: Some(client_auth),
             must_issue_new_ticket: self.must_issue_new_ticket,
+            fixed_kxkey: self.fixed_kxkey,
         }))
     }
 }
@@ -680,6 +698,7 @@ struct ExpectServerDone {
     server_kx: ServerKxDetails,
     client_auth: Option<ClientAuthDetails>,
     must_issue_new_ticket: bool,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 impl State<ClientConnectionData> for ExpectServerDone {
@@ -789,7 +808,26 @@ impl State<ClientConnectionData> for ExpectServerDone {
                 .ok_or_else(|| {
                     Error::PeerMisbehavedError("peer chose an unsupported group".to_string())
                 })?;
-        let kx = kx::KeyExchange::start(group).ok_or(Error::FailedToGetRandomBytes)?;
+
+        // PATCHED
+        let mut kx = None;
+        if let Some((g, key)) = st.fixed_kxkey {
+            if ecdh_params.curve_params.named_group == g {
+                kx = Some(
+                    kx::KeyExchange::start_fixed(group, key)
+                        .ok_or(Error::FailedToGetRandomBytes)?,
+                );
+            } else {
+                warn!(
+                    "a fixed key of {:?} is specified, while {:?} is negotiated",
+                    g, ecdh_params.curve_params.named_group
+                );
+            }
+        }
+        let kx = match kx {
+            Some(kx) => kx,
+            None => kx::KeyExchange::start(group).ok_or(Error::FailedToGetRandomBytes)?,
+        };
 
         // 5b.
         let mut transcript = st.transcript;

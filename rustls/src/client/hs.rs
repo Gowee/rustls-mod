@@ -87,6 +87,7 @@ pub(super) fn start_handshake(
     cx: &mut ClientContext<'_>,
     random: Option<Random>,
     session_id: Option<SessionID>,
+    fixed_kskey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
     fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
     f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
 ) -> NextStateOrError {
@@ -108,8 +109,9 @@ pub(super) fn start_handshake(
         cx,
     );
 
+    // PATCHED:
     let key_share = if support_tls13 {
-        if let Some((group, key)) = fixed_kxkey {
+        if let Some((group, key)) = fixed_kskey {
             Some(tls13::initial_key_share_fixed(
                 &config,
                 &server_name,
@@ -170,6 +172,7 @@ pub(super) fn start_handshake(
         extra_exts,
         may_send_sct_list,
         None,
+        fixed_kxkey,
         f,
     ))
 }
@@ -188,6 +191,7 @@ struct ExpectServerHello {
     sent_tls13_fake_ccs: bool,
     suite: Option<SupportedCipherSuite>,
     allowed_unsolicited_extensions: Option<Vec<ExtensionType>>,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
 struct ExpectServerHelloOrHelloRetryRequest {
@@ -211,6 +215,7 @@ fn emit_client_hello_for_retry(
     extra_exts: Vec<ClientExtension>,
     may_send_sct_list: bool,
     suite: Option<SupportedCipherSuite>,
+    fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
     f: Option<impl FnOnce(&mut Message) -> Option<Vec<ExtensionType>>>,
 ) -> NextState {
     // Do we have a SessionID or ticket cached for this host?
@@ -435,6 +440,7 @@ fn emit_client_hello_for_retry(
         sent_tls13_fake_ccs,
         suite,
         allowed_unsolicited_extensions,
+        fixed_kxkey,
     };
 
     if support_tls13 && retryreq.is_none() {
@@ -554,7 +560,8 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         // let allowed_unsolicited = [ExtensionType::RenegotiationInfo]; PATCHED:
         let allowed_unsolicited = self
-            .allowed_unsolicited_extensions.as_deref()
+            .allowed_unsolicited_extensions
+            .as_deref()
             .unwrap_or(&[ExtensionType::RenegotiationInfo]);
         if self
             .hello
@@ -665,6 +672,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     randoms,
                     using_ems: self.using_ems,
                     transcript,
+                    fixed_kxkey: self.fixed_kxkey,
                 }
                 .handle_server_hello(cx, suite, server_hello, tls13_supported)
             }
@@ -812,6 +820,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
             self.extra_exts,
             may_send_sct_list,
             Some(cs),
+            None, // TODO: fixed_kxkey
             None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
         ))
     }
