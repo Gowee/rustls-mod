@@ -125,23 +125,30 @@ pub(super) fn start_handshake(
         None
     };
 
-    if session_id.is_none() {
-        if let Some(_resuming) = &mut resuming_session {
-            #[cfg(feature = "tls12")]
-            if let persist::ClientSessionValue::Tls12(inner) = &mut _resuming.value {
-                // If we have a ticket, we use the sessionid as a signal that
-                // we're  doing an abbreviated handshake.  See section 3.4 in
-                // RFC5077.
-                if !inner.ticket().is_empty() {
-                    inner.session_id = SessionID::random()?;
-                }
+    if let Some(_resuming) = &mut resuming_session {
+        #[cfg(feature = "tls12")]
+        if let persist::ClientSessionValue::Tls12(inner) = &mut _resuming.value {
+            // If we have a ticket, we use the sessionid as a signal that
+            // we're  doing an abbreviated handshake.  See section 3.4 in
+            // RFC5077.
+            if !inner.ticket().is_empty() {
+                // inner.session_id = SessionID::random()?;
+                // PATCHED:
+                inner.session_id = match session_id {
+                    Some(sid) => sid,
+                    None => SessionID::random()?,
+                };
+            }
+            // session_id = Some(inner.session_id);
+            if session_id.is_none() {
+                // PATCHED: this effectively disable resumption based on session-id
                 session_id = Some(inner.session_id);
             }
-
-            debug!("Resuming session");
-        } else {
-            debug!("Not resuming any session");
         }
+
+        debug!("Resuming session");
+    } else {
+        debug!("Not resuming any session");
     }
 
     // https://tools.ietf.org/html/rfc8446#appendix-D.4
