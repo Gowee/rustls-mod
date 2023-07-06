@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 
-use std::convert::{TryFrom, TryInto};
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use rustls::internal::msgs::codec::Reader;
 use rustls::internal::msgs::message::{Message, OpaqueMessage, PlainMessage};
-use rustls::server::AllowAnyAuthenticatedClient;
+use rustls::server::{
+    AllowAnyAnonymousOrAuthenticatedClient, AllowAnyAuthenticatedClient, UnparsedCertRevocationList,
+};
 use rustls::Connection;
 use rustls::Error;
 use rustls::RootCertStore;
@@ -46,6 +47,7 @@ embed_files! {
     (ECDSA_CLIENT_FULLCHAIN, "ecdsa", "client.fullchain");
     (ECDSA_CLIENT_KEY, "ecdsa", "client.key");
     (ECDSA_CLIENT_REQ, "ecdsa", "client.req");
+    (ECDSA_CLIENT_CRL_PEM, "ecdsa", "client.revoked.crl.pem");
     (ECDSA_END_CERT, "ecdsa", "end.cert");
     (ECDSA_END_CHAIN, "ecdsa", "end.chain");
     (ECDSA_END_FULLCHAIN, "ecdsa", "end.fullchain");
@@ -65,6 +67,7 @@ embed_files! {
     (EDDSA_CLIENT_FULLCHAIN, "eddsa", "client.fullchain");
     (EDDSA_CLIENT_KEY, "eddsa", "client.key");
     (EDDSA_CLIENT_REQ, "eddsa", "client.req");
+    (EDDSA_CLIENT_CRL_PEM, "eddsa", "client.revoked.crl.pem");
     (EDDSA_END_CERT, "eddsa", "end.cert");
     (EDDSA_END_CHAIN, "eddsa", "end.chain");
     (EDDSA_END_FULLCHAIN, "eddsa", "end.fullchain");
@@ -83,6 +86,7 @@ embed_files! {
     (RSA_CLIENT_KEY, "rsa", "client.key");
     (RSA_CLIENT_REQ, "rsa", "client.req");
     (RSA_CLIENT_RSA, "rsa", "client.rsa");
+    (RSA_CLIENT_CRL_PEM, "rsa", "client.revoked.crl.pem");
     (RSA_END_CERT, "rsa", "end.cert");
     (RSA_END_CHAIN, "rsa", "end.chain");
     (RSA_END_FULLCHAIN, "rsa", "end.fullchain");
@@ -177,7 +181,7 @@ where
     total
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum KeyType {
     Rsa,
     Ecdsa,
@@ -189,9 +193,9 @@ pub static ALL_KEY_TYPES: [KeyType; 3] = [KeyType::Rsa, KeyType::Ecdsa, KeyType:
 impl KeyType {
     fn bytes_for(&self, part: &str) -> &'static [u8] {
         match self {
-            KeyType::Rsa => bytes_for("rsa", part),
-            KeyType::Ecdsa => bytes_for("ecdsa", part),
-            KeyType::Ed25519 => bytes_for("eddsa", part),
+            Self::Rsa => bytes_for("rsa", part),
+            Self::Ecdsa => bytes_for("ecdsa", part),
+            Self::Ed25519 => bytes_for("eddsa", part),
         }
     }
 
@@ -217,6 +221,18 @@ impl KeyType {
             .iter()
             .map(|v| Certificate(v.clone()))
             .collect()
+    }
+
+    pub fn client_crl(&self) -> UnparsedCertRevocationList {
+        UnparsedCertRevocationList(
+            rustls_pemfile::crls(&mut io::BufReader::new(
+                self.bytes_for("client.revoked.crl.pem"),
+            ))
+            .unwrap()
+            .into_iter()
+            .next() // We only expect one CRL.
+            .unwrap(),
+        )
     }
 
     fn get_client_key(&self) -> PrivateKey {
@@ -272,7 +288,9 @@ pub fn make_server_config_with_kx_groups(
 }
 
 pub fn get_client_root_store(kt: KeyType) -> RootCertStore {
-    let roots = kt.get_chain();
+    let mut roots = kt.get_chain();
+    // drop server cert
+    roots.drain(0..1);
     let mut client_auth_roots = RootCertStore::empty();
     for root in roots {
         client_auth_roots.add(&root).unwrap();
@@ -280,14 +298,40 @@ pub fn get_client_root_store(kt: KeyType) -> RootCertStore {
     client_auth_roots
 }
 
-pub fn make_server_config_with_mandatory_client_auth(kt: KeyType) -> ServerConfig {
+pub fn make_server_config_with_mandatory_client_auth_crls(
+    kt: KeyType,
+    crls: Vec<UnparsedCertRevocationList>,
+) -> ServerConfig {
     let client_auth_roots = get_client_root_store(kt);
 
-    let client_auth = AllowAnyAuthenticatedClient::new(client_auth_roots);
+    let client_auth = AllowAnyAuthenticatedClient::new(client_auth_roots)
+        .with_crls(crls)
+        .unwrap();
 
     ServerConfig::builder()
         .with_safe_defaults()
-        .with_client_cert_verifier(client_auth)
+        .with_client_cert_verifier(Arc::new(client_auth))
+        .with_single_cert(kt.get_chain(), kt.get_key())
+        .unwrap()
+}
+
+pub fn make_server_config_with_mandatory_client_auth(kt: KeyType) -> ServerConfig {
+    make_server_config_with_mandatory_client_auth_crls(kt, Vec::new())
+}
+
+pub fn make_server_config_with_optional_client_auth(
+    kt: KeyType,
+    crls: Vec<UnparsedCertRevocationList>,
+) -> ServerConfig {
+    let client_auth_roots = get_client_root_store(kt);
+
+    let client_auth = AllowAnyAnonymousOrAuthenticatedClient::new(client_auth_roots)
+        .with_crls(crls)
+        .unwrap();
+
+    ServerConfig::builder()
+        .with_safe_defaults()
+        .with_client_cert_verifier(Arc::new(client_auth))
         .with_single_cert(kt.get_chain(), kt.get_key())
         .unwrap()
 }
@@ -379,7 +423,7 @@ pub fn make_pair_for_arc_configs(
     server_config: &Arc<ServerConfig>,
 ) -> (ClientConnection, ServerConnection) {
     (
-        ClientConnection::new(Arc::clone(client_config), dns_name("localhost")).unwrap(),
+        ClientConnection::new(Arc::clone(client_config), server_name("localhost")).unwrap(),
         ServerConnection::new(Arc::clone(server_config)).unwrap(),
     )
 }
@@ -453,7 +497,7 @@ pub fn do_handshake_until_both_error(
     }
 }
 
-pub fn dns_name(name: &'static str) -> rustls::ServerName {
+pub fn server_name(name: &'static str) -> rustls::ServerName {
     name.try_into().unwrap()
 }
 
@@ -463,7 +507,7 @@ pub struct FailsReads {
 
 impl FailsReads {
     pub fn new(errkind: io::ErrorKind) -> Self {
-        FailsReads { errkind }
+        Self { errkind }
     }
 }
 

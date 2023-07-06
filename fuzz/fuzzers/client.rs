@@ -4,12 +4,7 @@ extern crate libfuzzer_sys;
 extern crate rustls;
 extern crate webpki;
 
-use rustls::{
-    ClientConfig,
-    ClientConnection,
-    RootCertStore
-};
-use std::convert::TryInto;
+use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use std::io;
 use std::sync::Arc;
 
@@ -24,4 +19,5 @@ fuzz_target!(|data: &[u8]| {
     let example_com = "example.com".try_into().unwrap();
     let mut client = ClientConnection::new(config, example_com).unwrap();
     let _ = client.read_tls(&mut io::Cursor::new(data));
+    let _ = client.process_new_packets();
 });

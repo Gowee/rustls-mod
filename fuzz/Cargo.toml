@@ -4,13 +4,13 @@ name = "rustls-fuzz"
 version = "0.0.1"
 authors = ["Automatically generated"]
 publish = false
-resolver = "2"
+edition = "2021"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-webpki = "0.22"
+webpki = { package = "rustls-webpki", version = "0.101.0", features = ["alloc", "std"] }
 
 [dependencies.rustls]
 path = "../rustls"
@@ -34,10 +34,6 @@ name = "fragment"
 path = "fuzzers/fragment.rs"
 
 [[bin]]
-name = "hsjoiner"
-path = "fuzzers/hsjoiner.rs"
-
-[[bin]]
 name = "persist"
 path = "fuzzers/persist.rs"
 
@@ -48,3 +44,7 @@ path = "fuzzers/client.rs"
 [[bin]]
 name = "server"
 path = "fuzzers/server.rs"
+
+[[bin]]
+name = "server_name"
+path = "fuzzers/server_name.rs"

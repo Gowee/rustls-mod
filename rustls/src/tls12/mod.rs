@@ -1,12 +1,14 @@
 use crate::cipher::{MessageDecrypter, MessageEncrypter};
-use crate::conn::{CommonState, ConnectionRandoms, Side};
-use crate::enums::{CipherSuite, SignatureScheme};
+use crate::common_state::{CommonState, Side};
+use crate::conn::ConnectionRandoms;
+use crate::enums::{AlertDescription, CipherSuite, SignatureScheme};
+use crate::error::{Error, InvalidMessage};
 use crate::kx;
 use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::enums::{AlertDescription, ContentType};
 use crate::msgs::handshake::KeyExchangeAlgorithm;
 use crate::suites::{BulkAlgorithm, CipherSuiteCommon, SupportedCipherSuite};
-use crate::Error;
+#[cfg(feature = "secret_extraction")]
+use crate::suites::{ConnectionTrafficSecrets, PartiallyExtractedSecrets};
 
 use ring::aead;
 use ring::digest::Digest;
@@ -19,7 +21,6 @@ pub(crate) use cipher::{AesGcm, ChaCha20Poly1305, Tls12AeadAlgorithm};
 mod prf;
 
 /// The TLS1.2 ciphersuite TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256.
-#[cfg(feature = "tls12")]
 pub static TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: SupportedCipherSuite =
     SupportedCipherSuite::Tls12(&Tls12CipherSuite {
         common: CipherSuiteCommon {
@@ -36,7 +37,6 @@ pub static TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: SupportedCipherSuite =
     });
 
 /// The TLS1.2 ciphersuite TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-#[cfg(feature = "tls12")]
 pub static TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: SupportedCipherSuite =
     SupportedCipherSuite::Tls12(&Tls12CipherSuite {
         common: CipherSuiteCommon {
@@ -53,7 +53,6 @@ pub static TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: SupportedCipherSuite =
     });
 
 /// The TLS1.2 ciphersuite TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-#[cfg(feature = "tls12")]
 pub static TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite =
     SupportedCipherSuite::Tls12(&Tls12CipherSuite {
         common: CipherSuiteCommon {
@@ -70,7 +69,6 @@ pub static TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite =
     });
 
 /// The TLS1.2 ciphersuite TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-#[cfg(feature = "tls12")]
 pub static TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite =
     SupportedCipherSuite::Tls12(&Tls12CipherSuite {
         common: CipherSuiteCommon {
@@ -87,7 +85,6 @@ pub static TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite =
     });
 
 /// The TLS1.2 ciphersuite TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-#[cfg(feature = "tls12")]
 pub static TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite =
     SupportedCipherSuite::Tls12(&Tls12CipherSuite {
         common: CipherSuiteCommon {
@@ -104,7 +101,6 @@ pub static TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite =
     });
 
 /// The TLS1.2 ciphersuite TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-#[cfg(feature = "tls12")]
 pub static TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite =
     SupportedCipherSuite::Tls12(&Tls12CipherSuite {
         common: CipherSuiteCommon {
@@ -120,7 +116,6 @@ pub static TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite =
         hmac_algorithm: ring::hmac::HMAC_SHA384,
     });
 
-#[cfg(feature = "tls12")]
 static TLS12_ECDSA_SCHEMES: &[SignatureScheme] = &[
     SignatureScheme::ED25519,
     SignatureScheme::ECDSA_NISTP521_SHA512,
@@ -128,7 +123,6 @@ static TLS12_ECDSA_SCHEMES: &[SignatureScheme] = &[
     SignatureScheme::ECDSA_NISTP256_SHA256,
 ];
 
-#[cfg(feature = "tls12")]
 static TLS12_RSA_SCHEMES: &[SignatureScheme] = &[
     SignatureScheme::RSA_PSS_SHA512,
     SignatureScheme::RSA_PSS_SHA384,
@@ -139,7 +133,6 @@ static TLS12_RSA_SCHEMES: &[SignatureScheme] = &[
 ];
 
 /// A TLS 1.2 cipher suite supported by rustls.
-#[cfg(feature = "tls12")]
 pub struct Tls12CipherSuite {
     /// Common cipher suite fields.
     pub common: CipherSuiteCommon,
@@ -165,7 +158,6 @@ pub struct Tls12CipherSuite {
     pub(crate) aead_alg: &'static dyn Tls12AeadAlgorithm,
 }
 
-#[cfg(feature = "tls12")]
 impl Tls12CipherSuite {
     /// Resolve the set of supported `SignatureScheme`s from the
     /// offered `SupportedSignatureSchemes`.  If we return an empty
@@ -184,21 +176,18 @@ impl Tls12CipherSuite {
     }
 }
 
-#[cfg(feature = "tls12")]
 impl From<&'static Tls12CipherSuite> for SupportedCipherSuite {
     fn from(s: &'static Tls12CipherSuite) -> Self {
         Self::Tls12(s)
     }
 }
 
-#[cfg(feature = "tls12")]
 impl PartialEq for Tls12CipherSuite {
     fn eq(&self, other: &Self) -> bool {
         self.common.suite == other.common.suite
     }
 }
 
-#[cfg(feature = "tls12")]
 impl fmt::Debug for Tls12CipherSuite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tls12CipherSuite")
@@ -394,7 +383,91 @@ impl ConnectionSecrets {
             &self.master_secret,
             label,
             &randoms,
-        )
+        );
+    }
+
+    #[cfg(feature = "secret_extraction")]
+    pub(crate) fn extract_secrets(&self, side: Side) -> Result<PartiallyExtractedSecrets, Error> {
+        // Make a key block, and chop it up
+        let key_block = self.make_key_block();
+
+        let suite = self.suite;
+        let algo = suite.common.aead_algorithm;
+
+        let (client_key, key_block) = key_block.split_at(algo.key_len());
+        let (server_key, key_block) = key_block.split_at(algo.key_len());
+        let (client_iv, key_block) = key_block.split_at(suite.fixed_iv_len);
+        let (server_iv, extra) = key_block.split_at(suite.fixed_iv_len);
+
+        // A key/IV pair (fixed IV len is 4 for GCM, 12 for Chacha)
+        struct Pair<'a> {
+            key: &'a [u8],
+            iv: &'a [u8],
+        }
+
+        let client_pair = Pair {
+            key: client_key,
+            iv: client_iv,
+        };
+        let server_pair = Pair {
+            key: server_key,
+            iv: server_iv,
+        };
+
+        let (client_secrets, server_secrets) = if algo == &ring::aead::AES_128_GCM {
+            let extract = |pair: Pair| -> ConnectionTrafficSecrets {
+                let mut key = [0u8; 16];
+                key.copy_from_slice(pair.key);
+
+                let mut salt = [0u8; 4];
+                salt.copy_from_slice(pair.iv);
+
+                let mut iv = [0u8; 8];
+                iv.copy_from_slice(&extra[..8]);
+
+                ConnectionTrafficSecrets::Aes128Gcm { key, salt, iv }
+            };
+
+            (extract(client_pair), extract(server_pair))
+        } else if algo == &ring::aead::AES_256_GCM {
+            let extract = |pair: Pair| -> ConnectionTrafficSecrets {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(pair.key);
+
+                let mut salt = [0u8; 4];
+                salt.copy_from_slice(pair.iv);
+
+                let mut iv = [0u8; 8];
+                iv.copy_from_slice(&extra[..8]);
+
+                ConnectionTrafficSecrets::Aes256Gcm { key, salt, iv }
+            };
+
+            (extract(client_pair), extract(server_pair))
+        } else if algo == &ring::aead::CHACHA20_POLY1305 {
+            let extract = |pair: Pair| -> ConnectionTrafficSecrets {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(pair.key);
+
+                let mut iv = [0u8; 12];
+                iv.copy_from_slice(pair.iv);
+
+                ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv }
+            };
+
+            (extract(client_pair), extract(server_pair))
+        } else {
+            return Err(Error::General(format!(
+                "exporting secrets for {:?}: unimplemented",
+                algo
+            )));
+        };
+
+        let (tx, rx) = match side {
+            Side::Client => (client_secrets, server_secrets),
+            Side::Server => (server_secrets, client_secrets),
+        };
+        Ok(PartiallyExtractedSecrets { tx, rx })
     }
 }
 
@@ -425,18 +498,14 @@ pub(crate) fn decode_ecdh_params<T: Codec>(
     common: &mut CommonState,
     kx_params: &[u8],
 ) -> Result<T, Error> {
-    decode_ecdh_params_::<T>(kx_params).ok_or_else(|| {
-        common.send_fatal_alert(AlertDescription::DecodeError);
-        Error::CorruptMessagePayload(ContentType::Handshake)
-    })
-}
-
-fn decode_ecdh_params_<T: Codec>(kx_params: &[u8]) -> Option<T> {
     let mut rd = Reader::init(kx_params);
     let ecdh_params = T::read(&mut rd)?;
     match rd.any_left() {
-        false => Some(ecdh_params),
-        true => None,
+        false => Ok(ecdh_params),
+        true => Err(common.send_fatal_alert(
+            AlertDescription::DecodeError,
+            InvalidMessage::InvalidDhParams,
+        )),
     }
 }
 
@@ -445,6 +514,7 @@ pub(crate) const DOWNGRADE_SENTINEL: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common_state::{CommonState, Side};
     use crate::msgs::handshake::{ClientECDHParams, ServerECDHParams};
 
     #[test]
@@ -454,11 +524,14 @@ mod tests {
         let mut server_buf = Vec::new();
         server_params.encode(&mut server_buf);
         server_buf.push(34);
-        assert!(decode_ecdh_params_::<ServerECDHParams>(&server_buf).is_none());
+
+        let mut common = CommonState::new(Side::Client);
+        assert!(decode_ecdh_params::<ServerECDHParams>(&mut common, &server_buf).is_err());
     }
 
     #[test]
     fn client_ecdhe_invalid() {
-        assert!(decode_ecdh_params_::<ClientECDHParams>(&[34]).is_none());
+        let mut common = CommonState::new(Side::Server);
+        assert!(decode_ecdh_params::<ClientECDHParams>(&mut common, &[34]).is_err());
     }
 }

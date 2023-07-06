@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-Rustls is a modern TLS library written in Rust.  It uses <a href = "https://github.com/briansmith/ring"><em>ring</em></a> for cryptography and <a href = "https://github.com/briansmith/webpki">webpki</a> for certificate
+Rustls is a modern TLS library written in Rust.  It uses <a href = "https://github.com/briansmith/ring"><em>ring</em></a> for cryptography and <a href = "https://github.com/rustls/webpki">webpki</a> for certificate
 verification.
 </p>
 
 # Status
-Rustls is ready for use.  There are no major breaking interface changes
-envisioned after the set included in the 0.20 release.
+Rustls is mature and widely used. While most of the API surface is stable, we expect the next
+few releases will make further changes as needed to accomodate new features or performance improvements.
 
 If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -20,46 +20,70 @@ If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Release history
 
-* Next release
-  - Planned: removal of unused signature verification schemes at link-time.
-  - Expose AlertDescription, ContentType, and HandshakeType,
-    SignatureAlgorithm, and NamedGroup as part of the stable API. Previously they
-    were part of the unstable internals API, but were referenced by parts of the
-    stable API.
-* 0.20.6 (2022-05-18)
-  - 0.20.5 included a change to track more context for the `Error::CorruptMessage`
-    which made API-incompatible changes to the `Error` type. We yanked 0.20.5
-    and have reverted that change as part of 0.20.6.
-* 0.20.5 (2022-05-14)
-  - Correct compatbility with servers which return no TLS extensions and take
-    advantage of a special case encoding.
-  - Remove spurious warn-level logging introduced in 0.20.3.
-  - Expose cipher suites in `ClientHello` type.
-  - Allow verification of IP addresses with `dangerous_config` enabled.
-  - Retry I/O operations in `ConnectionCommon::complete_io()` when interrupted.
-  - Fix server::ResolvesServerCertUsingSni case sensitivity.
-* 0.20.4 (2022-02-19)
-  - Correct regression in QUIC 0-RTT support.
-* 0.20.3 (2022-02-13)
-  - Support loading ECDSA keys in SEC1 format.
-  - Support receipt of 0-RTT "early data" in TLS1.3 servers.  It is not enabled
-    by default; opt in by setting `ServerConfig::max_early_data_size` to a non-zero
-    value.
-  - Support sending of data with the first server flight.  This is also not
-    enabled by default either: opt in by setting `ServerConfig::send_half_rtt_data`.
-  - Support `read_buf` interface when compiled with nightly. This means
-    data can be safely read out of a rustls connection into a buffer without
-    the buffer requiring initialisation first.  Set the `read_buf` feature to
-    use this.
-  - Improve efficiency when writing vectors of TLS types.
-  - Reduce copying and improve efficiency in TLS1.2 handshake.
-* 0.20.2 (2021-11-21)
-  - Fix `CipherSuite::as_str()` value (as introduced in 0.20.1).
-* 0.20.1 (2021-11-14)
-  - Allow cipher suite enum items to be stringified.
-  - Improve documentation of configuration builder types.
-  - Ensure unused cipher suites can be removed at link-time.
-  - Ensure single-use error types implement `std::error::Error`, and are public.
+* Release 0.21.3 (2023-07-05)
+  - Added `with_crls` function to `AllowAnyAuthenticatedClient` and
+    `AllowAnyAnonymousOrAuthenticatedClient` client certificate verifiers to
+    support revocation checking of client certificates using certificate
+    revocation lists (CRLs).
+  - Exposed `verify_signed_by_trust_anchor` and `verify_server_name` certificate
+    validation helper functions when using the "dangerous_configuration"
+    feature.
+* Release 0.21.2 (2023-06-14)
+  - Bump MSRV to 1.60 to track similar change in dependencies.
+  - Differentiate between unexpected and expected EOF in `Stream` and `OwnedStream`.
+  - `RootCertStore::add_parsable_certificates` now takes a `&[impl AsRef<[u8]>]`.
+  - Add QUIC V2 support.
+* Release 0.21.1 (2023-05-01)
+  - Remove `warn`-level logging from code paths that also return a `rustls::Error` with
+    the same information.
+  - Bug fix: ensure `ConnectionCommon::complete_io` flushes pending writes.
+  - Bug fix: correct encoding of acceptable issuer subjects when rustls operates as a server
+    requesting client authentication.  This was a regression introduced in 0.21.0.
+* Release 0.21.0 (2023-03-29)
+  - Support for connecting to peers named with IP addresses.  This means
+    rustls now depends on a fork of webpki - `rustls-webpki` - with a suitably
+    extended API.
+  - *Breaking change*: `StoresClientSessions` trait renamed to `ClientSessionStore` and
+    reworked to allow storage of multiple TLS1.3 tickets and avoid reuse of them.
+    This is a privacy improvement, see RFC8446 appendix C.4.
+  - *Breaking change*: the `DistinguishedNames` type alias no longer exists; the public
+    API now exports a `DistinguishedName` type, and the
+    `ClientCertVerifier::client_auth_root_subjects()` method now returns a
+    `&[DistinguishedName]` instead (with the lifetime constrained to the
+    verifier's).
+  - *Breaking change*: the `ClientCertVerifier` methods `client_auth_mandatory()`
+    and `client_auth_root_subjects()` no longer return an `Option`. You can now
+    use an `Acceptor` to decide whether to accept the connection based on information
+    from the `ClientHello` (like server name).
+  - *Breaking change*: rework `rustls::Error` to avoid String usage in
+    `PeerMisbehavedError`, `PeerIncompatibleError` and certificate errors.
+    Especially note that custom certificate verifiers should move to use the
+    new certificate errors. `Error` is now `non_exhaustive`, and so are the
+    inner enums used in its variants.
+  - *Breaking change*: replace `webpki::Error` appearing in the public API
+    in `RootCertStore::add`.
+  - The number of tickets sent by a TLS1.3 server is now configurable via
+    `ServerConfig::send_tls13_tickets`.  Previously one ticket was sent, now
+    the default is four.
+  - *Breaking change*: remove deprecated methods from `Acceptor`.
+  - *Breaking change*: `AllowAnyAuthenticatedClient` and `AllowAnyAnonymousOrAuthenticatedClient`
+    `new` functions now return `Self`. A `boxed` function was added to both types to easily acquire
+    an `Arc<dyn ClientCertVerifier>`.
+  - *Breaking change*: `NoClientAuth::new` was renamed to `boxed`.
+  - *Breaking change*: the QUIC API has changed to provide QUIC-specific `ClientConnection` and
+    `ServerConnection` types, instead of using an extension trait.
+  - *Breaking change*: the QUIC `Secrets` constructor was changed to take
+    a `Side` instead of `bool`.
+  - *Breaking change*: the `export_keying_material` function on a `Connection`
+    was changed from returning `Result<(), Error>` to `Result<T, Error>` where
+    `T: AsMut<[u8]>`.
+  - *Breaking change*: the `sni_hostname` function on a `Connection` was renamed
+    to `server_name`.
+  - *Breaking change*: remove alternative type names deprecated in 0.20.0 (`RSASigningKey` vs.
+    `RsaSigningKey` etc.)
+  - *Breaking change*: the client config `session_storage` and `enable_tickets`
+    fields have been replaced by a more misuse resistant `Resumption` type that
+    combines the two options.
 
 See [RELEASE_NOTES.md](RELEASE_NOTES.md) for further change history.
 
@@ -124,21 +148,23 @@ need them.
 
 ### Platform support
 
-Rustls uses [`ring`](https://crates.io/crates/ring) for implementing the
-cryptography in TLS. As a result, rustls only runs on platforms
-[supported by `ring`](https://github.com/briansmith/ring#online-automated-testing).
-At the time of writing this means x86, x86-64, armv7, and aarch64.
+While Rustls itself is platform independent it uses
+[`ring`](https://crates.io/crates/ring) for implementing the cryptography in
+TLS. As a result, rustls only runs on platforms
+supported by `ring`. At the time of writing this means x86, x86-64, armv7, and
+aarch64. For more information see [the supported `ring` CI
+targets](https://github.com/briansmith/ring/blob/9cc0d45f4d8521f467bb3a621e74b1535e118188/.github/workflows/ci.yml#L151-L167).
 
-Rustls requires Rust 1.56 or later.
+Rustls requires Rust 1.60 or later.
 
 # Example code
 There are two example programs which use
 [mio](https://github.com/carllerche/mio) to do asynchronous IO.
 
 ## Client example program
-The client example program is named `tlsclient`.  The interface looks like:
+The client example program is named `tlsclient-mio`.  The interface looks like:
 
-```tlsclient
+```tlsclient-mio
 Connects to the TLS server at hostname:PORT.  The default PORT
 is 443.  By default, this reads a request from stdin (to EOF)
 before making the connection.  --http replaces this with a
@@ -148,9 +174,9 @@ If --cafile is not supplied, a built-in set of CA certificates
 are used from the webpki-roots crate.
 
 Usage:
-  tlsclient [options] [--suite SUITE ...] [--proto PROTO ...] <hostname>
-  tlsclient (--version | -v)
-  tlsclient (--help | -h)
+  tlsclient-mio [options] [--suite SUITE ...] [--proto PROTO ...] [--protover PROTOVER ...] <hostname>
+  tlsclient-mio (--version | -v)
+  tlsclient-mio (--help | -h)
 
 Options:
     -p, --port PORT     Connect to PORT [default: 443].
@@ -165,7 +191,6 @@ Options:
                         SUITE instead.  May be used multiple times.
     --proto PROTOCOL    Send ALPN extension containing PROTOCOL.
                         May be used multiple times to offer several protocols.
-    --cache CACHE       Save session cache to file CACHE.
     --no-tickets        Disable session ticket support.
     --no-sni            Disable server name indication support.
     --insecure          Disable certificate verification.
@@ -178,7 +203,7 @@ Options:
 Some sample runs:
 
 ```
-$ cargo run --example tlsclient -- --http mozilla-modern.badssl.com
+$ cargo run --bin tlsclient-mio -- --http mozilla-modern.badssl.com
 HTTP/1.1 200 OK
 Server: nginx/1.6.2 (Ubuntu)
 Date: Wed, 01 Jun 2016 18:44:00 GMT
@@ -190,15 +215,15 @@ Content-Length: 644
 or
 
 ```
-$ cargo run --example tlsclient -- --http expired.badssl.com
-TLS error: WebPkiError(CertExpired, ValidateServerCert)
+$ cargo run --bin tlsclient-mio -- --http expired.badssl.com
+TLS error: InvalidCertificate(Expired)
 Connection closed
 ```
 
 ## Server example program
-The server example program is named `tlsserver`.  The interface looks like:
+The server example program is named `tlsserver-mio`.  The interface looks like:
 
-```tlsserver
+```tlsserver-mio
 Runs a TLS server on :PORT.  The default PORT is 443.
 
 `echo' mode means the server echoes received data on each connection.
@@ -213,11 +238,11 @@ localhost:fport.
 RSA private key.
 
 Usage:
-  tlsserver --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [options] echo
-  tlsserver --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [options] http
-  tlsserver --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [options] forward <fport>
-  tlsserver (--version | -v)
-  tlsserver (--help | -h)
+  tlsserver-mio --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [--protover PROTOVER ...] [options] echo
+  tlsserver-mio --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [--protover PROTOVER ...] [options] http
+  tlsserver-mio --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [--protover PROTOVER ...] [options] forward <fport>
+  tlsserver-mio (--version | -v)
+  tlsserver-mio (--help | -h)
 
 Options:
     -p, --port PORT     Listen on PORT [default: 443].
@@ -247,16 +272,16 @@ Options:
 ```
 
 Here's a sample run; we start a TLS echo server, then connect to it with
-openssl and tlsclient:
+`openssl` and `tlsclient-mio`:
 
 ```
-$ cargo run --example tlsserver -- --certs test-ca/rsa/end.fullchain --key test-ca/rsa/end.rsa -p 8443 echo &
+$ cargo run --bin tlsserver-mio -- --certs test-ca/rsa/end.fullchain --key test-ca/rsa/end.rsa -p 8443 echo &
 $ echo hello world | openssl s_client -ign_eof -quiet -connect localhost:8443
 depth=2 CN = ponytown RSA CA
 verify error:num=19:self signed certificate in certificate chain
 hello world
 ^C
-$ echo hello world | cargo run --example tlsclient -- --cafile test-ca/rsa/ca.cert -p 8443 localhost
+$ echo hello world | cargo run --bin tlsclient-mio -- --cafile test-ca/rsa/ca.cert -p 8443 localhost
 hello world
 ^C
 ```

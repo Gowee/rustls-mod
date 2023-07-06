@@ -1,8 +1,6 @@
+#![cfg_attr(read_buf, feature(read_buf))]
 //! Assorted public API tests.
 use std::cell::RefCell;
-use std::convert::TryFrom;
-#[cfg(feature = "tls12")]
-use std::convert::TryInto;
 use std::fmt;
 use std::io::{self, IoSlice, Read, Write};
 use std::mem;
@@ -11,15 +9,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use log;
-
-use rustls::client::ResolvesClientCert;
+use rustls::client::{ResolvesClientCert, Resumption};
 use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::codec::Codec;
-#[cfg(feature = "quic")]
-use rustls::quic::{self, ClientQuicExt, QuicExt, ServerQuicExt};
 use rustls::server::{AllowAnyAnonymousOrAuthenticatedClient, ClientHello, ResolvesServerCert};
-use rustls::{sign, ConnectionCommon, Error, KeyLog, SideData};
+#[cfg(feature = "secret_extraction")]
+use rustls::ConnectionTrafficSecrets;
+use rustls::{
+    sign, CertificateError, ConnectionCommon, Error, KeyLog, PeerIncompatible, PeerMisbehaved,
+    SideData,
+};
 use rustls::{CipherSuite, ProtocolVersion, SignatureScheme};
 use rustls::{ClientConfig, ClientConnection};
 use rustls::{ServerConfig, ServerConnection};
@@ -101,12 +100,12 @@ fn version_test(
     result: Option<ProtocolVersion>,
 ) {
     let client_versions = if client_versions.is_empty() {
-        &rustls::ALL_VERSIONS
+        rustls::ALL_VERSIONS
     } else {
         client_versions
     };
     let server_versions = if server_versions.is_empty() {
-        &rustls::ALL_VERSIONS
+        rustls::ALL_VERSIONS
     } else {
         server_versions
     };
@@ -183,6 +182,34 @@ fn check_read(reader: &mut dyn io::Read, bytes: &[u8]) {
     let mut buf = vec![0u8; bytes.len() + 1];
     assert_eq!(bytes.len(), reader.read(&mut buf).unwrap());
     assert_eq!(bytes, &buf[..bytes.len()]);
+}
+
+fn check_read_err(reader: &mut dyn io::Read, err_kind: io::ErrorKind) {
+    let mut buf = vec![0u8; 1];
+    let err = reader.read(&mut buf).unwrap_err();
+    assert!(matches!(err, err  if err.kind()  == err_kind))
+}
+
+#[cfg(read_buf)]
+fn check_read_buf(reader: &mut dyn io::Read, bytes: &[u8]) {
+    use std::{io::BorrowedBuf, mem::MaybeUninit};
+
+    let mut buf = [MaybeUninit::<u8>::uninit(); 128];
+    let mut buf: BorrowedBuf<'_> = buf.as_mut_slice().into();
+    reader.read_buf(buf.unfilled()).unwrap();
+    assert_eq!(buf.filled(), bytes);
+}
+
+#[cfg(read_buf)]
+fn check_read_buf_err(reader: &mut dyn io::Read, err_kind: io::ErrorKind) {
+    use std::{io::BorrowedBuf, mem::MaybeUninit};
+
+    let mut buf = [MaybeUninit::<u8>::uninit(); 1];
+    let mut buf: BorrowedBuf<'_> = buf.as_mut_slice().into();
+    let err = reader
+        .read_buf(buf.unfilled())
+        .unwrap_err();
+    assert!(matches!(err, err  if err.kind()  == err_kind))
 }
 
 #[test]
@@ -456,7 +483,7 @@ fn server_allow_any_anonymous_or_authenticated_client() {
 
         let server_config = ServerConfig::builder()
             .with_safe_defaults()
-            .with_client_cert_verifier(client_auth)
+            .with_client_cert_verifier(Arc::new(client_auth))
             .with_single_cert(kt.get_chain(), kt.get_key())
             .unwrap();
         let server_config = Arc::new(server_config);
@@ -593,8 +620,10 @@ fn server_closes_uncleanly() {
         assert!(!io_state.peer_has_closed());
         check_read(&mut client.reader(), b"from-server!");
 
-        assert!(matches!(client.reader().read(&mut [0u8; 1]),
-                         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof));
+        check_read_err(
+            &mut client.reader() as &mut dyn io::Read,
+            io::ErrorKind::UnexpectedEof,
+        );
 
         // may still transmit pending frames
         transfer(&mut client, &mut server);
@@ -636,8 +665,10 @@ fn client_closes_uncleanly() {
         assert!(!io_state.peer_has_closed());
         check_read(&mut server.reader(), b"from-client!");
 
-        assert!(matches!(server.reader().read(&mut [0u8; 1]),
-                         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof));
+        check_read_err(
+            &mut server.reader() as &mut dyn io::Read,
+            io::ErrorKind::UnexpectedEof,
+        );
 
         // may still transmit pending frames
         transfer(&mut server, &mut client);
@@ -718,7 +749,8 @@ fn server_cert_resolve_with_sni() {
         });
 
         let mut client =
-            ClientConnection::new(Arc::new(client_config), dns_name("the-value-from-sni")).unwrap();
+            ClientConnection::new(Arc::new(client_config), server_name("the-value-from-sni"))
+                .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
         let err = do_handshake_until_error(&mut client, &mut server);
@@ -739,7 +771,7 @@ fn server_cert_resolve_with_alpn() {
         });
 
         let mut client =
-            ClientConnection::new(Arc::new(client_config), dns_name("sni-value")).unwrap();
+            ClientConnection::new(Arc::new(client_config), server_name("sni-value")).unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
         let err = do_handshake_until_error(&mut client, &mut server);
@@ -759,7 +791,7 @@ fn client_trims_terminating_dot() {
         });
 
         let mut client =
-            ClientConnection::new(Arc::new(client_config), dns_name("some-host.com.")).unwrap();
+            ClientConnection::new(Arc::new(client_config), server_name("some-host.com.")).unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
         let err = do_handshake_until_error(&mut client, &mut server);
@@ -790,7 +822,8 @@ fn check_sigalgs_reduced_by_ciphersuite(
         ..Default::default()
     });
 
-    let mut client = ClientConnection::new(Arc::new(client_config), dns_name("localhost")).unwrap();
+    let mut client =
+        ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
     let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
     let err = do_handshake_until_error(&mut client, &mut server);
@@ -850,7 +883,8 @@ fn client_with_sni_disabled_does_not_send_sni() {
             client_config.enable_sni = false;
 
             let mut client =
-                ClientConnection::new(Arc::new(client_config), dns_name("value-not-sent")).unwrap();
+                ClientConnection::new(Arc::new(client_config), server_name("value-not-sent"))
+                    .unwrap();
             let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
 
             let err = do_handshake_until_error(&mut client, &mut server);
@@ -868,7 +902,7 @@ fn client_checks_server_certificate_with_given_name() {
             let client_config = make_client_config_with_versions(*kt, &[version]);
             let mut client = ClientConnection::new(
                 Arc::new(client_config),
-                dns_name("not-the-right-hostname.com"),
+                server_name("not-the-right-hostname.com"),
             )
             .unwrap();
             let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
@@ -876,8 +910,57 @@ fn client_checks_server_certificate_with_given_name() {
             let err = do_handshake_until_error(&mut client, &mut server);
             assert_eq!(
                 err,
-                Err(ErrorFromPeer::Client(Error::InvalidCertificateData(
-                    "invalid peer certificate: CertNotValidForName".into(),
+                Err(ErrorFromPeer::Client(Error::InvalidCertificate(
+                    CertificateError::NotValidForName
+                )))
+            );
+        }
+    }
+}
+
+#[test]
+fn client_checks_server_certificate_with_given_ip_address() {
+    fn check_server_name(
+        client_config: Arc<ClientConfig>,
+        server_config: Arc<ServerConfig>,
+        name: &'static str,
+    ) -> Result<(), ErrorFromPeer> {
+        let mut client = ClientConnection::new(client_config, server_name(name)).unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
+        do_handshake_until_error(&mut client, &mut server)
+    }
+
+    for kt in ALL_KEY_TYPES.iter() {
+        let server_config = Arc::new(make_server_config(*kt));
+
+        for version in rustls::ALL_VERSIONS {
+            let client_config = Arc::new(make_client_config_with_versions(*kt, &[version]));
+
+            // positive ipv4 case
+            assert_eq!(
+                check_server_name(client_config.clone(), server_config.clone(), "198.51.100.1"),
+                Ok(()),
+            );
+
+            // negative ipv4 case
+            assert_eq!(
+                check_server_name(client_config.clone(), server_config.clone(), "198.51.100.2"),
+                Err(ErrorFromPeer::Client(Error::InvalidCertificate(
+                    CertificateError::NotValidForName
+                )))
+            );
+
+            // positive ipv6 case
+            assert_eq!(
+                check_server_name(client_config.clone(), server_config.clone(), "2001:db8::1"),
+                Ok(()),
+            );
+
+            // negative ipv6 case
+            assert_eq!(
+                check_server_name(client_config.clone(), server_config.clone(), "2001:db8::2"),
+                Err(ErrorFromPeer::Client(Error::InvalidCertificate(
+                    CertificateError::NotValidForName
                 )))
             );
         }
@@ -887,13 +970,21 @@ fn client_checks_server_certificate_with_given_name() {
 struct ClientCheckCertResolve {
     query_count: AtomicUsize,
     expect_queries: usize,
+    expect_issuers: Vec<Vec<u8>>,
+    expect_sigschemes: Vec<SignatureScheme>,
 }
 
 impl ClientCheckCertResolve {
-    fn new(expect_queries: usize) -> Self {
-        ClientCheckCertResolve {
+    fn new(
+        expect_queries: usize,
+        expect_issuers: Vec<Vec<u8>>,
+        expect_sigschemes: Vec<SignatureScheme>,
+    ) -> Self {
+        Self {
             query_count: AtomicUsize::new(0),
             expect_queries,
+            expect_issuers,
+            expect_sigschemes,
         }
     }
 }
@@ -924,6 +1015,9 @@ impl ResolvesClientCert for ClientCheckCertResolve {
             panic!("no signature schemes shared by server");
         }
 
+        assert_eq!(acceptable_issuers, self.expect_issuers);
+        assert_eq!(sigschemes, self.expect_sigschemes);
+
         None
     }
 
@@ -937,9 +1031,53 @@ fn client_cert_resolve() {
     for kt in ALL_KEY_TYPES.iter() {
         let server_config = Arc::new(make_server_config_with_mandatory_client_auth(*kt));
 
+        let expected_issuers = match *kt {
+            KeyType::Rsa => vec![
+                b"0,1*0(\x06\x03U\x04\x03\x0c!ponytown RSA level 2 intermediate".to_vec(),
+                b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponytown RSA CA".to_vec(),
+            ],
+            KeyType::Ecdsa => vec![
+                b"0.1,0*\x06\x03U\x04\x03\x0c#ponytown ECDSA level 2 intermediate".to_vec(),
+                b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown ECDSA CA".to_vec(),
+            ],
+            KeyType::Ed25519 => vec![
+                b"0.1,0*\x06\x03U\x04\x03\x0c#ponytown EdDSA level 2 intermediate".to_vec(),
+                b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown EdDSA CA".to_vec(),
+            ],
+        };
+
         for version in rustls::ALL_VERSIONS {
+            let expected_sigschemes = match version.version {
+                ProtocolVersion::TLSv1_2 => vec![
+                    SignatureScheme::ECDSA_NISTP384_SHA384,
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::ED25519,
+                    SignatureScheme::RSA_PSS_SHA512,
+                    SignatureScheme::RSA_PSS_SHA384,
+                    SignatureScheme::RSA_PSS_SHA256,
+                    SignatureScheme::RSA_PKCS1_SHA512,
+                    SignatureScheme::RSA_PKCS1_SHA384,
+                    SignatureScheme::RSA_PKCS1_SHA256,
+                ],
+                ProtocolVersion::TLSv1_3 => vec![
+                    SignatureScheme::ECDSA_NISTP384_SHA384,
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::ED25519,
+                    SignatureScheme::RSA_PSS_SHA512,
+                    SignatureScheme::RSA_PSS_SHA384,
+                    SignatureScheme::RSA_PSS_SHA256,
+                ],
+                _ => unreachable!(),
+            };
+
+            println!("{:?} {:?}:", version.version, *kt);
+
             let mut client_config = make_client_config_with_versions(*kt, &[version]);
-            client_config.client_auth_cert_resolver = Arc::new(ClientCheckCertResolve::new(1));
+            client_config.client_auth_cert_resolver = Arc::new(ClientCheckCertResolve::new(
+                1,
+                expected_issuers.clone(),
+                expected_sigschemes,
+            ));
 
             let (mut client, mut server) =
                 make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
@@ -962,6 +1100,56 @@ fn client_auth_works() {
             let (mut client, mut server) =
                 make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
             do_handshake(&mut client, &mut server);
+        }
+    }
+}
+
+#[test]
+fn client_mandatory_auth_revocation_works() {
+    for kt in ALL_KEY_TYPES.iter() {
+        // Create a server configuration that includes a CRL that specifies the client certificate
+        // is revoked.
+        let crls = vec![kt.client_crl()];
+        let server_config = Arc::new(make_server_config_with_mandatory_client_auth_crls(
+            *kt, crls,
+        ));
+
+        for version in rustls::ALL_VERSIONS {
+            let client_config = make_client_config_with_versions_with_auth(*kt, &[version]);
+            let (mut client, mut server) =
+                make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+            // Because the client certificate is revoked, the handshake should fail.
+            let err = do_handshake_until_error(&mut client, &mut server);
+            assert_eq!(
+                err,
+                Err(ErrorFromPeer::Server(Error::InvalidCertificate(
+                    CertificateError::Revoked
+                )))
+            );
+        }
+    }
+}
+
+#[test]
+fn client_optional_auth_revocation_works() {
+    for kt in ALL_KEY_TYPES.iter() {
+        // Create a server configuration that includes a CRL that specifies the client certificate
+        // is revoked.
+        let crls = vec![kt.client_crl()];
+        let server_config = Arc::new(make_server_config_with_optional_client_auth(*kt, crls));
+
+        for version in rustls::ALL_VERSIONS {
+            let client_config = make_client_config_with_versions_with_auth(*kt, &[version]);
+            let (mut client, mut server) =
+                make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+            // Because the client certificate is revoked, the handshake should fail.
+            let err = do_handshake_until_error(&mut client, &mut server);
+            assert_eq!(
+                err,
+                Err(ErrorFromPeer::Server(Error::InvalidCertificate(
+                    CertificateError::Revoked
+                )))
+            );
         }
     }
 }
@@ -1317,6 +1505,7 @@ fn client_complete_io_for_handshake() {
         .unwrap();
     assert!(rdlen > 0 && wrlen > 0);
     assert!(!client.is_handshaking());
+    assert!(!client.wants_write());
 }
 
 #[test]
@@ -1392,6 +1581,7 @@ fn server_complete_io_for_handshake() {
             .unwrap();
         assert!(rdlen > 0 && wrlen > 0);
         assert!(!server.is_handshaking());
+        assert!(!server.wants_write());
     }
 }
 
@@ -1458,128 +1648,133 @@ fn server_complete_io_for_read() {
 
 #[test]
 fn client_stream_write() {
-    for kt in ALL_KEY_TYPES.iter() {
-        let (mut client, mut server) = make_pair(*kt);
-
-        {
-            let mut pipe = OtherSession::new(&mut server);
-            let mut stream = Stream::new(&mut client, &mut pipe);
-            assert_eq!(stream.write(b"hello").unwrap(), 5);
-        }
-        check_read(&mut server.reader(), b"hello");
-    }
+    test_client_stream_write(StreamKind::Ref);
+    test_client_stream_write(StreamKind::Owned);
 }
 
 #[test]
-fn client_streamowned_write() {
-    for kt in ALL_KEY_TYPES.iter() {
-        let (client, mut server) = make_pair(*kt);
+fn server_stream_write() {
+    test_server_stream_write(StreamKind::Ref);
+    test_server_stream_write(StreamKind::Owned);
+}
 
+#[derive(Debug, Copy, Clone)]
+enum StreamKind {
+    Owned,
+    Ref,
+}
+
+fn test_client_stream_write(stream_kind: StreamKind) {
+    for kt in ALL_KEY_TYPES.iter() {
+        let (mut client, mut server) = make_pair(*kt);
+        let data = b"hello";
         {
-            let pipe = OtherSession::new(&mut server);
-            let mut stream = StreamOwned::new(client, pipe);
-            assert_eq!(stream.write(b"hello").unwrap(), 5);
+            let mut pipe = OtherSession::new(&mut server);
+            let mut stream: Box<dyn Write> = match stream_kind {
+                StreamKind::Ref => Box::new(Stream::new(&mut client, &mut pipe)),
+                StreamKind::Owned => Box::new(StreamOwned::new(client, pipe)),
+            };
+            assert_eq!(stream.write(data).unwrap(), 5);
         }
-        check_read(&mut server.reader(), b"hello");
+        check_read(&mut server.reader(), data);
+    }
+}
+
+fn test_server_stream_write(stream_kind: StreamKind) {
+    for kt in ALL_KEY_TYPES.iter() {
+        let (mut client, mut server) = make_pair(*kt);
+        let data = b"hello";
+        {
+            let mut pipe = OtherSession::new(&mut client);
+            let mut stream: Box<dyn Write> = match stream_kind {
+                StreamKind::Ref => Box::new(Stream::new(&mut server, &mut pipe)),
+                StreamKind::Owned => Box::new(StreamOwned::new(server, pipe)),
+            };
+            assert_eq!(stream.write(data).unwrap(), 5);
+        }
+        check_read(&mut client.reader(), data);
     }
 }
 
 #[test]
 fn client_stream_read() {
-    for kt in ALL_KEY_TYPES.iter() {
-        let (mut client, mut server) = make_pair(*kt);
-
-        server
-            .writer()
-            .write_all(b"world")
-            .unwrap();
-
-        {
-            let mut pipe = OtherSession::new(&mut server);
-            let mut stream = Stream::new(&mut client, &mut pipe);
-            check_read(&mut stream, b"world");
-        }
-    }
-}
-
-#[test]
-fn client_streamowned_read() {
-    for kt in ALL_KEY_TYPES.iter() {
-        let (client, mut server) = make_pair(*kt);
-
-        server
-            .writer()
-            .write_all(b"world")
-            .unwrap();
-
-        {
-            let pipe = OtherSession::new(&mut server);
-            let mut stream = StreamOwned::new(client, pipe);
-            check_read(&mut stream, b"world");
-        }
-    }
-}
-
-#[test]
-fn server_stream_write() {
-    for kt in ALL_KEY_TYPES.iter() {
-        let (mut client, mut server) = make_pair(*kt);
-
-        {
-            let mut pipe = OtherSession::new(&mut client);
-            let mut stream = Stream::new(&mut server, &mut pipe);
-            assert_eq!(stream.write(b"hello").unwrap(), 5);
-        }
-        check_read(&mut client.reader(), b"hello");
-    }
-}
-
-#[test]
-fn server_streamowned_write() {
-    for kt in ALL_KEY_TYPES.iter() {
-        let (mut client, server) = make_pair(*kt);
-
-        {
-            let pipe = OtherSession::new(&mut client);
-            let mut stream = StreamOwned::new(server, pipe);
-            assert_eq!(stream.write(b"hello").unwrap(), 5);
-        }
-        check_read(&mut client.reader(), b"hello");
+    test_client_stream_read(StreamKind::Ref, ReadKind::Buf);
+    test_client_stream_read(StreamKind::Owned, ReadKind::Buf);
+    #[cfg(read_buf)]
+    {
+        test_client_stream_read(StreamKind::Ref, ReadKind::BorrowedBuf);
+        test_client_stream_read(StreamKind::Owned, ReadKind::BorrowedBuf);
     }
 }
 
 #[test]
 fn server_stream_read() {
-    for kt in ALL_KEY_TYPES.iter() {
-        let (mut client, mut server) = make_pair(*kt);
+    test_server_stream_read(StreamKind::Ref, ReadKind::Buf);
+    test_server_stream_read(StreamKind::Owned, ReadKind::Buf);
+    #[cfg(read_buf)]
+    {
+        test_server_stream_read(StreamKind::Ref, ReadKind::BorrowedBuf);
+        test_server_stream_read(StreamKind::Owned, ReadKind::BorrowedBuf);
+    }
+}
 
-        client
-            .writer()
-            .write_all(b"world")
-            .unwrap();
+#[derive(Debug, Copy, Clone)]
+enum ReadKind {
+    Buf,
+    #[cfg(read_buf)]
+    BorrowedBuf,
+}
 
-        {
-            let mut pipe = OtherSession::new(&mut client);
-            let mut stream = Stream::new(&mut server, &mut pipe);
-            check_read(&mut stream, b"world");
+fn test_stream_read(read_kind: ReadKind, mut stream: impl Read, data: &[u8]) {
+    match read_kind {
+        ReadKind::Buf => {
+            check_read(&mut stream, data);
+            check_read_err(&mut stream, io::ErrorKind::UnexpectedEof)
+        }
+        #[cfg(read_buf)]
+        ReadKind::BorrowedBuf => {
+            check_read_buf(&mut stream, data);
+            check_read_buf_err(&mut stream, io::ErrorKind::UnexpectedEof)
         }
     }
 }
 
-#[test]
-fn server_streamowned_read() {
+fn test_client_stream_read(stream_kind: StreamKind, read_kind: ReadKind) {
     for kt in ALL_KEY_TYPES.iter() {
-        let (mut client, server) = make_pair(*kt);
-
-        client
-            .writer()
-            .write_all(b"world")
-            .unwrap();
+        let (mut client, mut server) = make_pair(*kt);
+        let data = b"world";
+        server.writer().write_all(data).unwrap();
 
         {
-            let pipe = OtherSession::new(&mut client);
-            let mut stream = StreamOwned::new(server, pipe);
-            check_read(&mut stream, b"world");
+            let mut pipe = OtherSession::new(&mut server);
+            transfer_eof(&mut client);
+
+            let stream: Box<dyn Read> = match stream_kind {
+                StreamKind::Ref => Box::new(Stream::new(&mut client, &mut pipe)),
+                StreamKind::Owned => Box::new(StreamOwned::new(client, pipe)),
+            };
+
+            test_stream_read(read_kind, stream, data)
+        }
+    }
+}
+
+fn test_server_stream_read(stream_kind: StreamKind, read_kind: ReadKind) {
+    for kt in ALL_KEY_TYPES.iter() {
+        let (mut client, mut server) = make_pair(*kt);
+        let data = b"world";
+        client.writer().write_all(data).unwrap();
+
+        {
+            let mut pipe = OtherSession::new(&mut client);
+            transfer_eof(&mut server);
+
+            let stream: Box<dyn Read> = match stream_kind {
+                StreamKind::Ref => Box::new(Stream::new(&mut server, &mut pipe)),
+                StreamKind::Owned => Box::new(StreamOwned::new(server, pipe)),
+            };
+
+            test_stream_read(read_kind, stream, data)
         }
     }
 }
@@ -1733,7 +1928,7 @@ fn server_stream_handshake_error() {
         assert!(rc.is_err());
         assert_eq!(
             format!("{:?}", rc),
-            "Err(Custom { kind: InvalidData, error: PeerIncompatibleError(\"no ciphersuites in common\") })"
+            "Err(Custom { kind: InvalidData, error: PeerIncompatible(NoCipherSuitesInCommon) })"
         );
     }
 }
@@ -1755,7 +1950,7 @@ fn server_streamowned_handshake_error() {
     assert!(rc.is_err());
     assert_eq!(
         format!("{:?}", rc),
-        "Err(Custom { kind: InvalidData, error: PeerIncompatibleError(\"no ciphersuites in common\") })"
+        "Err(Custom { kind: InvalidData, error: PeerIncompatible(NoCipherSuitesInCommon) })"
     );
 }
 
@@ -1804,14 +1999,16 @@ fn server_exposes_offered_sni() {
     let kt = KeyType::Rsa;
     for version in rustls::ALL_VERSIONS {
         let client_config = make_client_config_with_versions(kt, &[version]);
-        let mut client =
-            ClientConnection::new(Arc::new(client_config), dns_name("second.testserver.com"))
-                .unwrap();
+        let mut client = ClientConnection::new(
+            Arc::new(client_config),
+            server_name("second.testserver.com"),
+        )
+        .unwrap();
         let mut server = ServerConnection::new(Arc::new(make_server_config(kt))).unwrap();
 
-        assert_eq!(None, server.sni_hostname());
+        assert_eq!(None, server.server_name());
         do_handshake(&mut client, &mut server);
-        assert_eq!(Some("second.testserver.com"), server.sni_hostname());
+        assert_eq!(Some("second.testserver.com"), server.server_name());
     }
 }
 
@@ -1821,14 +2018,16 @@ fn server_exposes_offered_sni_smashed_to_lowercase() {
     let kt = KeyType::Rsa;
     for version in rustls::ALL_VERSIONS {
         let client_config = make_client_config_with_versions(kt, &[version]);
-        let mut client =
-            ClientConnection::new(Arc::new(client_config), dns_name("SECOND.TESTServer.com"))
-                .unwrap();
+        let mut client = ClientConnection::new(
+            Arc::new(client_config),
+            server_name("SECOND.TESTServer.com"),
+        )
+        .unwrap();
         let mut server = ServerConnection::new(Arc::new(make_server_config(kt))).unwrap();
 
-        assert_eq!(None, server.sni_hostname());
+        assert_eq!(None, server.server_name());
         do_handshake(&mut client, &mut server);
-        assert_eq!(Some("second.testserver.com"), server.sni_hostname());
+        assert_eq!(Some("second.testserver.com"), server.server_name());
     }
 }
 
@@ -1845,10 +2044,10 @@ fn server_exposes_offered_sni_even_if_resolver_fails() {
         let client_config = make_client_config_with_versions(kt, &[version]);
         let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
         let mut client =
-            ClientConnection::new(Arc::new(client_config), dns_name("thisdoesNOTexist.com"))
+            ClientConnection::new(Arc::new(client_config), server_name("thisdoesNOTexist.com"))
                 .unwrap();
 
-        assert_eq!(None, server.sni_hostname());
+        assert_eq!(None, server.server_name());
         transfer(&mut client, &mut server);
         assert_eq!(
             server.process_new_packets(),
@@ -1856,7 +2055,7 @@ fn server_exposes_offered_sni_even_if_resolver_fails() {
                 "no server certificate chain resolved".to_string()
             ))
         );
-        assert_eq!(Some("thisdoesnotexist.com"), server.sni_hostname());
+        assert_eq!(Some("thisdoesnotexist.com"), server.server_name());
     }
 }
 
@@ -1879,13 +2078,16 @@ fn sni_resolver_works() {
 
     let mut server1 = ServerConnection::new(Arc::clone(&server_config)).unwrap();
     let mut client1 =
-        ClientConnection::new(Arc::new(make_client_config(kt)), dns_name("localhost")).unwrap();
+        ClientConnection::new(Arc::new(make_client_config(kt)), server_name("localhost")).unwrap();
     let err = do_handshake_until_error(&mut client1, &mut server1);
     assert_eq!(err, Ok(()));
 
     let mut server2 = ServerConnection::new(Arc::clone(&server_config)).unwrap();
-    let mut client2 =
-        ClientConnection::new(Arc::new(make_client_config(kt)), dns_name("notlocalhost")).unwrap();
+    let mut client2 = ClientConnection::new(
+        Arc::new(make_client_config(kt)),
+        server_name("notlocalhost"),
+    )
+    .unwrap();
     let err = do_handshake_until_error(&mut client2, &mut server2);
     assert_eq!(
         err,
@@ -1948,7 +2150,7 @@ fn sni_resolver_lower_cases_configured_names() {
 
     let mut server1 = ServerConnection::new(Arc::clone(&server_config)).unwrap();
     let mut client1 =
-        ClientConnection::new(Arc::new(make_client_config(kt)), dns_name("localhost")).unwrap();
+        ClientConnection::new(Arc::new(make_client_config(kt)), server_name("localhost")).unwrap();
     let err = do_handshake_until_error(&mut client1, &mut server1);
     assert_eq!(err, Ok(()));
 }
@@ -1975,7 +2177,7 @@ fn sni_resolver_lower_cases_queried_names() {
 
     let mut server1 = ServerConnection::new(Arc::clone(&server_config)).unwrap();
     let mut client1 =
-        ClientConnection::new(Arc::new(make_client_config(kt)), dns_name("LOCALHOST")).unwrap();
+        ClientConnection::new(Arc::new(make_client_config(kt)), server_name("LOCALHOST")).unwrap();
     let err = do_handshake_until_error(&mut client1, &mut server1);
     assert_eq!(err, Ok(()));
 }
@@ -2025,25 +2227,21 @@ fn do_exporter_test(client_config: ClientConfig, server_config: ServerConfig) {
     );
     do_handshake(&mut client, &mut server);
 
-    assert_eq!(
-        Ok(()),
-        client.export_keying_material(&mut client_secret, b"label", Some(b"context"))
-    );
-    assert_eq!(
-        Ok(()),
-        server.export_keying_material(&mut server_secret, b"label", Some(b"context"))
-    );
+    assert!(client
+        .export_keying_material(&mut client_secret, b"label", Some(b"context"))
+        .is_ok());
+    assert!(server
+        .export_keying_material(&mut server_secret, b"label", Some(b"context"))
+        .is_ok());
     assert_eq!(client_secret.to_vec(), server_secret.to_vec());
 
-    assert_eq!(
-        Ok(()),
-        client.export_keying_material(&mut client_secret, b"label", None)
-    );
+    assert!(client
+        .export_keying_material(&mut client_secret, b"label", None)
+        .is_ok());
     assert_ne!(client_secret.to_vec(), server_secret.to_vec());
-    assert_eq!(
-        Ok(()),
-        server.export_keying_material(&mut server_secret, b"label", None)
-    );
+    assert!(server
+        .export_keying_material(&mut server_secret, b"label", None)
+        .is_ok());
     assert_eq!(client_secret.to_vec(), server_secret.to_vec());
 }
 
@@ -2248,7 +2446,7 @@ struct KeyLogToVec {
 
 impl KeyLogToVec {
     fn new(who: &'static str) -> Self {
-        KeyLogToVec {
+        Self {
             label: who,
             items: Mutex::new(vec![]),
         }
@@ -2468,8 +2666,9 @@ fn vectored_write_for_server_handshake_with_half_rtt_data() {
     {
         let mut pipe = OtherSession::new(&mut client);
         let wrlen = server.write_tls(&mut pipe).unwrap();
-        assert_eq!(wrlen, 103);
-        assert_eq!(pipe.writevs, vec![vec![103]]);
+        // 4 tickets
+        assert_eq!(wrlen, 103 * 4);
+        assert_eq!(pipe.writevs, vec![vec![103, 103, 103, 103]]);
     }
 
     assert!(!server.is_handshaking());
@@ -2512,8 +2711,8 @@ fn check_half_rtt_does_not_work(server_config: ServerConfig) {
     {
         let mut pipe = OtherSession::new(&mut client);
         let wrlen = server.write_tls(&mut pipe).unwrap();
-        assert_eq!(wrlen, 177);
-        assert_eq!(pipe.writevs, vec![vec![103, 42, 32]]);
+        assert_eq!(wrlen, 486);
+        assert_eq!(pipe.writevs, vec![vec![103, 103, 103, 103, 42, 32]]);
     }
 
     assert!(!server.is_handshaking());
@@ -2611,7 +2810,7 @@ struct ServerStorage {
 
 impl ServerStorage {
     fn new() -> Self {
-        ServerStorage {
+        Self {
             storage: rustls::server::ServerSessionMemoryCache::new(1024),
             put_count: AtomicUsize::new(0),
             get_count: AtomicUsize::new(0),
@@ -2664,53 +2863,131 @@ impl rustls::server::StoresServerSessions for ServerStorage {
     }
 }
 
+#[derive(Debug, Clone)]
+enum ClientStorageOp {
+    SetKxHint(rustls::ServerName, rustls::NamedGroup),
+    GetKxHint(rustls::ServerName, Option<rustls::NamedGroup>),
+    SetTls12Session(rustls::ServerName),
+    GetTls12Session(rustls::ServerName, bool),
+    RemoveTls12Session(rustls::ServerName),
+    InsertTls13Ticket(rustls::ServerName),
+    TakeTls13Ticket(rustls::ServerName, bool),
+}
+
 struct ClientStorage {
-    storage: Arc<dyn rustls::client::StoresClientSessions>,
-    put_count: AtomicUsize,
-    get_count: AtomicUsize,
-    last_put_key: Mutex<Option<Vec<u8>>>,
+    storage: Arc<dyn rustls::client::ClientSessionStore>,
+    ops: Mutex<Vec<ClientStorageOp>>,
 }
 
 impl ClientStorage {
     fn new() -> Self {
-        ClientStorage {
-            storage: rustls::client::ClientSessionMemoryCache::new(1024),
-            put_count: AtomicUsize::new(0),
-            get_count: AtomicUsize::new(0),
-            last_put_key: Mutex::new(None),
+        Self {
+            storage: Arc::new(rustls::client::ClientSessionMemoryCache::new(1024)),
+            ops: Mutex::new(Vec::new()),
         }
     }
 
-    fn puts(&self) -> usize {
-        self.put_count.load(Ordering::SeqCst)
+    #[cfg(feature = "tls12")]
+    fn ops(&self) -> Vec<ClientStorageOp> {
+        self.ops.lock().unwrap().clone()
     }
-    fn gets(&self) -> usize {
-        self.get_count.load(Ordering::SeqCst)
+
+    #[cfg(feature = "tls12")]
+    fn ops_and_reset(&self) -> Vec<ClientStorageOp> {
+        std::mem::take(&mut self.ops.lock().unwrap())
     }
 }
 
 impl fmt::Debug for ClientStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "(puts: {:?}, gets: {:?} )",
-            self.put_count, self.get_count
-        )
+        write!(f, "(ops: {:?})", self.ops.lock().unwrap())
     }
 }
 
-impl rustls::client::StoresClientSessions for ClientStorage {
-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        self.put_count
-            .fetch_add(1, Ordering::SeqCst);
-        *self.last_put_key.lock().unwrap() = Some(key.clone());
-        self.storage.put(key, value)
+impl rustls::client::ClientSessionStore for ClientStorage {
+    fn set_kx_hint(&self, server_name: &rustls::ServerName, group: rustls::NamedGroup) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::SetKxHint(server_name.clone(), group));
+        self.storage
+            .set_kx_hint(server_name, group)
     }
 
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.get_count
-            .fetch_add(1, Ordering::SeqCst);
-        self.storage.get(key)
+    fn kx_hint(&self, server_name: &rustls::ServerName) -> Option<rustls::NamedGroup> {
+        let rc = self.storage.kx_hint(server_name);
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::GetKxHint(server_name.clone(), rc));
+        rc
+    }
+
+    fn set_tls12_session(
+        &self,
+        server_name: &rustls::ServerName,
+        value: rustls::client::Tls12ClientSessionValue,
+    ) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::SetTls12Session(server_name.clone()));
+        self.storage
+            .set_tls12_session(server_name, value)
+    }
+
+    fn tls12_session(
+        &self,
+        server_name: &rustls::ServerName,
+    ) -> Option<rustls::client::Tls12ClientSessionValue> {
+        let rc = self.storage.tls12_session(server_name);
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::GetTls12Session(
+                server_name.clone(),
+                rc.is_some(),
+            ));
+        rc
+    }
+
+    fn remove_tls12_session(&self, server_name: &rustls::ServerName) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::RemoveTls12Session(server_name.clone()));
+        self.storage
+            .remove_tls12_session(server_name);
+    }
+
+    fn insert_tls13_ticket(
+        &self,
+        server_name: &rustls::ServerName,
+        value: rustls::client::Tls13ClientSessionValue,
+    ) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::InsertTls13Ticket(server_name.clone()));
+        self.storage
+            .insert_tls13_ticket(server_name, value);
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        server_name: &rustls::ServerName,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        let rc = self
+            .storage
+            .take_tls13_ticket(server_name);
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::TakeTls13Ticket(
+                server_name.clone(),
+                rc.is_some(),
+            ));
+        rc
     }
 }
 
@@ -2728,7 +3005,7 @@ fn tls13_stateful_resumption() {
     // full handshake
     let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
     let (full_c2s, full_s2c) = do_handshake(&mut client, &mut server);
-    assert_eq!(storage.puts(), 1);
+    assert_eq!(storage.puts(), 4);
     assert_eq!(storage.gets(), 0);
     assert_eq!(storage.takes(), 0);
     assert_eq!(
@@ -2743,7 +3020,7 @@ fn tls13_stateful_resumption() {
     let (resume_c2s, resume_s2c) = do_handshake(&mut client, &mut server);
     assert!(resume_c2s > full_c2s);
     assert!(resume_s2c < full_s2c);
-    assert_eq!(storage.puts(), 2);
+    assert_eq!(storage.puts(), 8);
     assert_eq!(storage.gets(), 0);
     assert_eq!(storage.takes(), 1);
     assert_eq!(
@@ -2758,7 +3035,7 @@ fn tls13_stateful_resumption() {
     let (resume2_c2s, resume2_s2c) = do_handshake(&mut client, &mut server);
     assert_eq!(resume_s2c, resume2_s2c);
     assert_eq!(resume_c2s, resume2_c2s);
-    assert_eq!(storage.puts(), 3);
+    assert_eq!(storage.puts(), 12);
     assert_eq!(storage.gets(), 0);
     assert_eq!(storage.takes(), 2);
     assert_eq!(
@@ -2835,7 +3112,7 @@ fn early_data_configs() -> (Arc<ClientConfig>, Arc<ServerConfig>) {
     let kt = KeyType::Rsa;
     let mut client_config = make_client_config(kt);
     client_config.enable_early_data = true;
-    client_config.session_storage = Arc::new(ClientStorage::new());
+    client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
 
     let mut server_config = make_server_config(kt);
     server_config.max_early_data_size = 1234;
@@ -2929,12 +3206,12 @@ fn early_data_can_be_rejected_by_server() {
 #[cfg(feature = "quic")]
 mod test_quic {
     use super::*;
-    use rustls::Connection;
+    use rustls::quic::{self, ConnectionCommon};
 
     // Returns the sender's next secrets to use, or the receiver's error.
-    fn step(
-        send: &mut dyn QuicExt,
-        recv: &mut dyn QuicExt,
+    fn step<L: SideData, R: SideData>(
+        send: &mut ConnectionCommon<L>,
+        recv: &mut ConnectionCommon<R>,
     ) -> Result<Option<quic::KeyChange>, Error> {
         let mut buf = Vec::new();
         let change = loop {
@@ -2998,24 +3275,20 @@ mod test_quic {
         let server_params = &b"server params"[..];
 
         // full handshake
-        let mut client = Connection::from(
-            ClientConnection::new_quic(
-                Arc::clone(&client_config),
-                quic::Version::V1,
-                dns_name("localhost"),
-                client_params.into(),
-            )
-            .unwrap(),
-        );
+        let mut client = quic::ClientConnection::new(
+            Arc::clone(&client_config),
+            quic::Version::V1,
+            server_name("localhost"),
+            client_params.into(),
+        )
+        .unwrap();
 
-        let mut server = Connection::from(
-            ServerConnection::new_quic(
-                Arc::clone(&server_config),
-                quic::Version::V1,
-                server_params.into(),
-            )
-            .unwrap(),
-        );
+        let mut server = quic::ServerConnection::new(
+            Arc::clone(&server_config),
+            quic::Version::V1,
+            server_params.into(),
+        )
+        .unwrap();
 
         let client_initial = step(&mut client, &mut server).unwrap();
         assert!(client_initial.is_none());
@@ -3050,10 +3323,10 @@ mod test_quic {
             .is_none());
 
         // 0-RTT handshake
-        let mut client = ClientConnection::new_quic(
+        let mut client = quic::ClientConnection::new(
             Arc::clone(&client_config),
             quic::Version::V1,
-            dns_name("localhost"),
+            server_name("localhost"),
             client_params.into(),
         )
         .unwrap();
@@ -3061,7 +3334,7 @@ mod test_quic {
             .negotiated_cipher_suite()
             .is_some());
 
-        let mut server = ServerConnection::new_quic(
+        let mut server = quic::ServerConnection::new(
             Arc::clone(&server_config),
             quic::Version::V1,
             server_params.into(),
@@ -3092,20 +3365,21 @@ mod test_quic {
         // 0-RTT rejection
         {
             let client_config = (*client_config).clone();
-            let mut client = ClientConnection::new_quic(
+            let mut client = quic::ClientConnection::new(
                 Arc::new(client_config),
                 quic::Version::V1,
-                dns_name("localhost"),
+                server_name("localhost"),
                 client_params.into(),
             )
             .unwrap();
 
-            let mut server = ServerConnection::new_quic(
+            let mut server = quic::ServerConnection::new(
                 Arc::clone(&server_config),
                 quic::Version::V1,
                 server_params.into(),
             )
             .unwrap();
+            server.reject_early_data();
 
             step(&mut client, &mut server).unwrap();
             assert_eq!(client.quic_transport_parameters(), Some(server_params));
@@ -3124,16 +3398,16 @@ mod test_quic {
         }
 
         // failed handshake
-        let mut client = ClientConnection::new_quic(
+        let mut client = quic::ClientConnection::new(
             client_config,
             quic::Version::V1,
-            dns_name("example.com"),
+            server_name("example.com"),
             client_params.into(),
         )
         .unwrap();
 
         let mut server =
-            ServerConnection::new_quic(server_config, quic::Version::V1, server_params.into())
+            quic::ServerConnection::new(server_config, quic::Version::V1, server_params.into())
                 .unwrap();
 
         step(&mut client, &mut server).unwrap();
@@ -3143,7 +3417,7 @@ mod test_quic {
         assert!(step(&mut server, &mut client).is_err());
         assert_eq!(
             client.alert(),
-            Some(rustls::internal::msgs::enums::AlertDescription::BadCertificate)
+            Some(rustls::AlertDescription::BadCertificate)
         );
 
         // Key updates
@@ -3180,15 +3454,15 @@ mod test_quic {
             server_config.alpn_protocols = vec!["foo".into()];
             let server_config = Arc::new(server_config);
 
-            let mut client = ClientConnection::new_quic(
+            let mut client = quic::ClientConnection::new(
                 client_config,
                 quic::Version::V1,
-                dns_name("localhost"),
+                server_name("localhost"),
                 client_params.into(),
             )
             .unwrap();
             let mut server =
-                ServerConnection::new_quic(server_config, quic::Version::V1, server_params.into())
+                quic::ServerConnection::new(server_config, quic::Version::V1, server_params.into())
                     .unwrap();
 
             assert_eq!(
@@ -3200,7 +3474,7 @@ mod test_quic {
 
             assert_eq!(
                 server.alert(),
-                Some(rustls::internal::msgs::enums::AlertDescription::NoApplicationProtocol)
+                Some(rustls::AlertDescription::NoApplicationProtocol)
             );
         }
     }
@@ -3213,10 +3487,10 @@ mod test_quic {
         client_config.alpn_protocols = vec!["foo".into()];
         let client_config = Arc::new(client_config);
 
-        assert!(ClientConnection::new_quic(
+        assert!(quic::ClientConnection::new(
             client_config,
             quic::Version::V1,
-            dns_name("localhost"),
+            server_name("localhost"),
             b"client params".to_vec(),
         )
         .is_err());
@@ -3226,7 +3500,7 @@ mod test_quic {
         server_config.alpn_protocols = vec!["foo".into()];
         let server_config = Arc::new(server_config);
 
-        assert!(ServerConnection::new_quic(
+        assert!(quic::ServerConnection::new(
             server_config,
             quic::Version::V1,
             b"server params".to_vec(),
@@ -3255,7 +3529,7 @@ mod test_quic {
 
             let wrapped = Arc::new(server_config.clone());
             assert_eq!(
-                ServerConnection::new_quic(wrapped, quic::Version::V1, b"server params".to_vec(),)
+                quic::ServerConnection::new(wrapped, quic::Version::V1, b"server params".to_vec(),)
                     .is_ok(),
                 ok
             );
@@ -3268,18 +3542,20 @@ mod test_quic {
             make_server_config_with_versions(KeyType::Ed25519, &[&rustls::version::TLS13]);
         let server_config = Arc::new(server_config);
 
-        let mut server =
-            ServerConnection::new_quic(server_config, quic::Version::V1, b"server params".to_vec())
-                .unwrap();
+        let mut server = quic::ServerConnection::new(
+            server_config,
+            quic::Version::V1,
+            b"server params".to_vec(),
+        )
+        .unwrap();
 
         use ring::rand::SecureRandom;
         use rustls::internal::msgs::base::PayloadU16;
-        use rustls::internal::msgs::enums::{Compression, HandshakeType, NamedGroup};
+        use rustls::internal::msgs::enums::{Compression, NamedGroup};
         use rustls::internal::msgs::handshake::{
-            ClientHelloPayload, HandshakeMessagePayload, KeyShareEntry, Random, SessionID,
+            ClientHelloPayload, HandshakeMessagePayload, KeyShareEntry, Random, SessionId,
         };
-        use rustls::internal::msgs::message::PlainMessage;
-        use rustls::{CipherSuite, SignatureScheme};
+        use rustls::{CipherSuite, HandshakeType, SignatureScheme};
 
         let rng = ring::rand::SystemRandom::new();
         let mut random = [0; 32];
@@ -3291,40 +3567,35 @@ mod test_quic {
             .compute_public_key()
             .unwrap();
 
-        let client_hello = Message {
-            version: ProtocolVersion::TLSv1_3,
-            payload: MessagePayload::handshake(HandshakeMessagePayload {
-                typ: HandshakeType::ClientHello,
-                payload: HandshakePayload::ClientHello(ClientHelloPayload {
-                    client_version: ProtocolVersion::TLSv1_3,
-                    random,
-                    session_id: SessionID::random().unwrap(),
-                    cipher_suites: vec![CipherSuite::TLS13_AES_128_GCM_SHA256],
-                    compression_methods: vec![Compression::Null],
-                    extensions: vec![
-                        ClientExtension::SupportedVersions(vec![ProtocolVersion::TLSv1_3]),
-                        ClientExtension::NamedGroups(vec![NamedGroup::X25519]),
-                        ClientExtension::SignatureAlgorithms(vec![SignatureScheme::ED25519]),
-                        ClientExtension::KeyShare(vec![KeyShareEntry {
-                            group: NamedGroup::X25519,
-                            payload: PayloadU16::new(kx.as_ref().to_vec()),
-                        }]),
-                    ],
-                }),
+        let client_hello = MessagePayload::handshake(HandshakeMessagePayload {
+            typ: HandshakeType::ClientHello,
+            payload: HandshakePayload::ClientHello(ClientHelloPayload {
+                client_version: ProtocolVersion::TLSv1_3,
+                random,
+                session_id: SessionId::random().unwrap(),
+                cipher_suites: vec![CipherSuite::TLS13_AES_128_GCM_SHA256],
+                compression_methods: vec![Compression::Null],
+                extensions: vec![
+                    ClientExtension::SupportedVersions(vec![ProtocolVersion::TLSv1_3]),
+                    ClientExtension::NamedGroups(vec![NamedGroup::X25519]),
+                    ClientExtension::SignatureAlgorithms(vec![SignatureScheme::ED25519]),
+                    ClientExtension::KeyShare(vec![KeyShareEntry {
+                        group: NamedGroup::X25519,
+                        payload: PayloadU16::new(kx.as_ref().to_vec()),
+                    }]),
+                ],
             }),
-        };
+        });
 
-        let buf = PlainMessage::from(client_hello)
-            .into_unencrypted_opaque()
-            .encode();
-        server
-            .read_tls(&mut buf.as_slice())
-            .unwrap();
+        let mut buf = Vec::with_capacity(512);
+        client_hello.encode(&mut buf);
         assert_eq!(
-            server.process_new_packets().err(),
-            Some(Error::PeerMisbehavedError(
-                "QUIC transport parameters not found".into(),
-            )),
+            server
+                .read_hs(&mut buf.as_slice())
+                .err(),
+            Some(Error::PeerMisbehaved(
+                PeerMisbehaved::MissingQuicTransportParameters
+            ))
         );
     }
 
@@ -3337,12 +3608,11 @@ mod test_quic {
 
         use ring::rand::SecureRandom;
         use rustls::internal::msgs::base::PayloadU16;
-        use rustls::internal::msgs::enums::{Compression, HandshakeType, NamedGroup};
+        use rustls::internal::msgs::enums::{Compression, NamedGroup};
         use rustls::internal::msgs::handshake::{
-            ClientHelloPayload, HandshakeMessagePayload, KeyShareEntry, Random, SessionID,
+            ClientHelloPayload, HandshakeMessagePayload, KeyShareEntry, Random, SessionId,
         };
-        use rustls::internal::msgs::message::PlainMessage;
-        use rustls::{CipherSuite, SignatureScheme};
+        use rustls::{CipherSuite, HandshakeType, SignatureScheme};
 
         let rng = ring::rand::SystemRandom::new();
         let mut random = [0; 32];
@@ -3354,42 +3624,40 @@ mod test_quic {
             .compute_public_key()
             .unwrap();
 
-        let mut server =
-            ServerConnection::new_quic(server_config, quic::Version::V1, b"server params".to_vec())
-                .unwrap();
+        let mut server = quic::ServerConnection::new(
+            server_config,
+            quic::Version::V1,
+            b"server params".to_vec(),
+        )
+        .unwrap();
 
-        let client_hello = Message {
-            version: ProtocolVersion::TLSv1_2,
-            payload: MessagePayload::handshake(HandshakeMessagePayload {
-                typ: HandshakeType::ClientHello,
-                payload: HandshakePayload::ClientHello(ClientHelloPayload {
-                    client_version: ProtocolVersion::TLSv1_2,
-                    random: random.clone(),
-                    session_id: SessionID::random().unwrap(),
-                    cipher_suites: vec![CipherSuite::TLS13_AES_128_GCM_SHA256],
-                    compression_methods: vec![Compression::Null],
-                    extensions: vec![
-                        ClientExtension::NamedGroups(vec![NamedGroup::X25519]),
-                        ClientExtension::SignatureAlgorithms(vec![SignatureScheme::ED25519]),
-                        ClientExtension::KeyShare(vec![KeyShareEntry {
-                            group: NamedGroup::X25519,
-                            payload: PayloadU16::new(kx.as_ref().to_vec()),
-                        }]),
-                    ],
-                }),
+        let client_hello = MessagePayload::handshake(HandshakeMessagePayload {
+            typ: HandshakeType::ClientHello,
+            payload: HandshakePayload::ClientHello(ClientHelloPayload {
+                client_version: ProtocolVersion::TLSv1_2,
+                random: random.clone(),
+                session_id: SessionId::random().unwrap(),
+                cipher_suites: vec![CipherSuite::TLS13_AES_128_GCM_SHA256],
+                compression_methods: vec![Compression::Null],
+                extensions: vec![
+                    ClientExtension::NamedGroups(vec![NamedGroup::X25519]),
+                    ClientExtension::SignatureAlgorithms(vec![SignatureScheme::ED25519]),
+                    ClientExtension::KeyShare(vec![KeyShareEntry {
+                        group: NamedGroup::X25519,
+                        payload: PayloadU16::new(kx.as_ref().to_vec()),
+                    }]),
+                ],
             }),
-        };
+        });
 
-        let buf = PlainMessage::from(client_hello)
-            .into_unencrypted_opaque()
-            .encode();
-        server
-            .read_tls(&mut buf.as_slice())
-            .unwrap();
+        let mut buf = Vec::with_capacity(512);
+        client_hello.encode(&mut buf);
         assert_eq!(
-            server.process_new_packets().err(),
-            Some(Error::PeerIncompatibleError(
-                "Server requires TLS1.3, but client omitted versions ext".into(),
+            server
+                .read_hs(&mut buf.as_slice())
+                .err(),
+            Some(Error::PeerIncompatible(
+                PeerIncompatible::SupportedVersionsExtensionRequired
             )),
         );
     }
@@ -3397,6 +3665,7 @@ mod test_quic {
     #[test]
     fn packet_key_api() {
         use rustls::quic::{Keys, Version};
+        use rustls::Side;
 
         // Test vectors: https://www.rfc-editor.org/rfc/rfc9001.html#name-client-initial
         const CONNECTION_ID: &[u8] = &[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
@@ -3427,7 +3696,7 @@ mod test_quic {
             0x08, 0x06, 0x04, 0x80, 0x00, 0xff, 0xff,
         ];
 
-        let client_keys = Keys::initial(Version::V1, &CONNECTION_ID, true);
+        let client_keys = Keys::initial(Version::V1, &CONNECTION_ID, Side::Client);
         assert_eq!(
             client_keys
                 .local
@@ -3563,7 +3832,7 @@ mod test_quic {
         let (first, rest) = header.split_at_mut(1);
         let sample = &payload[..sample_len];
 
-        let server_keys = Keys::initial(Version::V1, &CONNECTION_ID, false);
+        let server_keys = Keys::initial(Version::V1, &CONNECTION_ID, Side::Server);
         server_keys
             .remote
             .header
@@ -3593,9 +3862,9 @@ mod test_quic {
 #[test]
 fn test_client_does_not_offer_sha1() {
     use rustls::internal::msgs::{
-        codec::Reader, enums::HandshakeType, handshake::HandshakePayload, message::MessagePayload,
-        message::OpaqueMessage,
+        codec::Reader, handshake::HandshakePayload, message::MessagePayload, message::OpaqueMessage,
     };
+    use rustls::HandshakeType;
 
     for kt in ALL_KEY_TYPES.iter() {
         for version in rustls::ALL_VERSIONS {
@@ -3650,6 +3919,7 @@ fn test_client_config_keyshare_mismatch() {
     assert!(do_handshake_until_error(&mut client, &mut server).is_err());
 }
 
+#[cfg(feature = "tls12")]
 #[test]
 fn test_client_sends_helloretryrequest() {
     // client sends a secp384r1 key share
@@ -3659,7 +3929,7 @@ fn test_client_sends_helloretryrequest() {
     );
 
     let storage = Arc::new(ClientStorage::new());
-    client_config.session_storage = storage.clone();
+    client_config.resumption = Resumption::store(storage.clone());
 
     // but server only accepts x25519, so a HRR is required
     let server_config =
@@ -3705,11 +3975,49 @@ fn test_client_sends_helloretryrequest() {
 
     do_handshake_until_error(&mut client, &mut server).unwrap();
 
-    // client only did two storage queries: one for a session, another for a kx type
-    assert_eq!(storage.gets(), 2);
-    assert_eq!(storage.puts(), 2);
+    // client only did following storage queries:
+    println!("storage {:#?}", storage.ops());
+    assert_eq!(storage.ops().len(), 9);
+    assert!(matches!(
+        storage.ops()[0],
+        ClientStorageOp::TakeTls13Ticket(_, false)
+    ));
+    assert!(matches!(
+        storage.ops()[1],
+        ClientStorageOp::GetTls12Session(_, false)
+    ));
+    assert!(matches!(
+        storage.ops()[2],
+        ClientStorageOp::GetKxHint(_, None)
+    ));
+    assert!(matches!(
+        storage.ops()[3],
+        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::X25519)
+    ));
+    assert!(matches!(
+        storage.ops()[4],
+        ClientStorageOp::RemoveTls12Session(_)
+    ));
+    // server sends 4 tickets by default
+    assert!(matches!(
+        storage.ops()[5],
+        ClientStorageOp::InsertTls13Ticket(_)
+    ));
+    assert!(matches!(
+        storage.ops()[6],
+        ClientStorageOp::InsertTls13Ticket(_)
+    ));
+    assert!(matches!(
+        storage.ops()[7],
+        ClientStorageOp::InsertTls13Ticket(_)
+    ));
+    assert!(matches!(
+        storage.ops()[8],
+        ClientStorageOp::InsertTls13Ticket(_)
+    ));
 }
 
+#[cfg(feature = "tls12")]
 #[test]
 fn test_client_attempts_to_use_unsupported_kx_group() {
     // common to both client configs
@@ -3719,13 +4027,13 @@ fn test_client_attempts_to_use_unsupported_kx_group() {
     //   into kx group cache.
     let mut client_config_1 =
         make_client_config_with_kx_groups(KeyType::Rsa, &[&rustls::kx_group::X25519]);
-    client_config_1.session_storage = shared_storage.clone();
+    client_config_1.resumption = Resumption::store(shared_storage.clone());
 
     // second, client only supports secp-384 and so kx group cache
     //   contains an unusable value.
     let mut client_config_2 =
         make_client_config_with_kx_groups(KeyType::Rsa, &[&rustls::kx_group::SECP384R1]);
-    client_config_2.session_storage = shared_storage;
+    client_config_2.resumption = Resumption::store(shared_storage.clone());
 
     let server_config = make_server_config(KeyType::Rsa);
 
@@ -3733,9 +4041,83 @@ fn test_client_attempts_to_use_unsupported_kx_group() {
     let (mut client_1, mut server) = make_pair_for_configs(client_config_1, server_config.clone());
     do_handshake_until_error(&mut client_1, &mut server).unwrap();
 
+    let ops = shared_storage.ops();
+    println!("storage {:#?}", ops);
+    assert_eq!(ops.len(), 9);
+    assert!(matches!(
+        ops[3],
+        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::X25519)
+    ));
+
     // second handshake
     let (mut client_2, mut server) = make_pair_for_configs(client_config_2, server_config);
     do_handshake_until_error(&mut client_2, &mut server).unwrap();
+
+    let ops = shared_storage.ops();
+    println!("storage {:?} {:#?}", ops.len(), ops);
+    assert_eq!(ops.len(), 17);
+    assert!(matches!(ops[9], ClientStorageOp::TakeTls13Ticket(_, true)));
+    assert!(matches!(
+        ops[10],
+        ClientStorageOp::GetKxHint(_, Some(rustls::NamedGroup::X25519))
+    ));
+    assert!(matches!(
+        ops[11],
+        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::secp384r1)
+    ));
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn test_tls13_client_resumption_does_not_reuse_tickets() {
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config = make_client_config(KeyType::Rsa);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::Rsa);
+    server_config.send_tls13_tickets = 5;
+    let server_config = Arc::new(server_config);
+
+    // first handshake: client obtains 5 tickets from server.
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake_until_error(&mut client, &mut server).unwrap();
+
+    let ops = shared_storage.ops_and_reset();
+    println!("storage {:#?}", ops);
+    assert_eq!(ops.len(), 10);
+    assert!(matches!(ops[5], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[6], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[7], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[8], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[9], ClientStorageOp::InsertTls13Ticket(_)));
+
+    // 5 subsequent handshakes: all are resumptions
+
+    // Note: we don't do complete the handshakes, because that means
+    // we get five additional tickets per connection which is unhelpful
+    // in this test.  It also acts to record a "Happy Eyeballs"-type use
+    // case, where a client speculatively makes many connection attempts
+    // in parallel without knowledge of which will work due to underlying
+    // connectivity uncertainty.
+    for _ in 0..5 {
+        let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+        transfer(&mut client, &mut server);
+        server.process_new_packets().unwrap();
+
+        let ops = shared_storage.ops_and_reset();
+        assert!(matches!(ops[0], ClientStorageOp::TakeTls13Ticket(_, true)));
+    }
+
+    // 6th subsequent handshake: cannot be resumed; we ran out of tickets
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+
+    let ops = shared_storage.ops_and_reset();
+    println!("last {:?}", ops);
+    assert!(matches!(ops[0], ClientStorageOp::TakeTls13Ticket(_, false)));
 }
 
 #[test]
@@ -3776,7 +4158,7 @@ fn test_client_mtu_reduction() {
         let mut client_config = make_client_config(*kt);
         client_config.max_fragment_size = Some(64);
         let mut client =
-            ClientConnection::new(Arc::new(client_config), dns_name("localhost")).unwrap();
+            ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
         let writes = collect_write_lengths(&mut client);
         println!("writes at mtu=64: {:?}", writes);
         assert!(writes.iter().all(|x| *x <= 64));
@@ -3831,7 +4213,7 @@ fn test_server_mtu_reduction() {
 fn check_client_max_fragment_size(size: usize) -> Option<Error> {
     let mut client_config = make_client_config(KeyType::Ed25519);
     client_config.max_fragment_size = Some(size);
-    ClientConnection::new(Arc::new(client_config), dns_name("localhost")).err()
+    ClientConnection::new(Arc::new(client_config), server_name("localhost")).err()
 }
 
 #[test]
@@ -3895,8 +4277,8 @@ fn test_server_rejects_duplicate_sni_names() {
     transfer_altered(&mut client, duplicate_sni_payload, &mut server);
     assert_eq!(
         server.process_new_packets(),
-        Err(Error::PeerMisbehavedError(
-            "ClientHello SNI contains duplicate name types".into()
+        Err(Error::PeerMisbehaved(
+            PeerMisbehaved::DuplicateServerNameTypes
         ))
     );
 }
@@ -3924,8 +4306,8 @@ fn test_server_rejects_empty_sni_extension() {
     transfer_altered(&mut client, empty_sni_payload, &mut server);
     assert_eq!(
         server.process_new_packets(),
-        Err(Error::PeerMisbehavedError(
-            "ClientHello SNI did not contain a hostname".into()
+        Err(Error::PeerMisbehaved(
+            PeerMisbehaved::ServerNameMustContainOneHostName
         ))
     );
 }
@@ -3955,8 +4337,8 @@ fn test_server_rejects_clients_without_any_kx_group_overlap() {
     transfer_altered(&mut client, different_kx_group, &mut server);
     assert_eq!(
         server.process_new_packets(),
-        Err(Error::PeerIncompatibleError(
-            "no kx group overlap with client".into()
+        Err(Error::PeerIncompatible(
+            PeerIncompatible::NoKxGroupsInCommon
         ))
     );
 }
@@ -3980,8 +4362,8 @@ fn test_client_rejects_illegal_tls13_ccs() {
     transfer_altered(&mut server, corrupt_ccs, &mut client);
     assert_eq!(
         client.process_new_packets(),
-        Err(Error::PeerMisbehavedError(
-            "illegal middlebox CCS received".into()
+        Err(Error::PeerMisbehaved(
+            PeerMisbehaved::IllegalMiddleboxChangeCipherSpec
         ))
     );
 }
@@ -3992,7 +4374,7 @@ fn test_client_rejects_illegal_tls13_ccs() {
 fn test_client_tls12_no_resume_after_server_downgrade() {
     let mut client_config = common::make_client_config(KeyType::Ed25519);
     let client_storage = Arc::new(ClientStorage::new());
-    client_config.session_storage = client_storage.clone();
+    client_config.resumption = Resumption::store(client_storage.clone());
     let client_config = Arc::new(client_config);
 
     let server_config_1 = Arc::new(common::finish_server_config(
@@ -4019,14 +4401,41 @@ fn test_client_tls12_no_resume_after_server_downgrade() {
         ClientConnection::new(client_config.clone(), "localhost".try_into().unwrap()).unwrap();
     let mut server_1 = ServerConnection::new(server_config_1).unwrap();
     common::do_handshake(&mut client_1, &mut server_1);
-    assert_eq!(client_storage.puts(), 2);
+
+    assert_eq!(client_storage.ops().len(), 9);
+    println!("hs1 storage ops: {:#?}", client_storage.ops());
+    assert!(matches!(
+        client_storage.ops()[3],
+        ClientStorageOp::SetKxHint(_, _)
+    ));
+    assert!(matches!(
+        client_storage.ops()[4],
+        ClientStorageOp::RemoveTls12Session(_)
+    ));
+    assert!(matches!(
+        client_storage.ops()[5],
+        ClientStorageOp::InsertTls13Ticket(_)
+    ));
 
     dbg!("handshake 2");
     let mut client_2 =
         ClientConnection::new(client_config, "localhost".try_into().unwrap()).unwrap();
     let mut server_2 = ServerConnection::new(Arc::new(server_config_2)).unwrap();
     common::do_handshake(&mut client_2, &mut server_2);
-    assert_eq!(client_storage.puts(), 2);
+    println!("hs2 storage ops: {:#?}", client_storage.ops());
+    assert_eq!(client_storage.ops().len(), 11);
+
+    // attempt consumes a TLS1.3 ticket
+    assert!(matches!(
+        client_storage.ops()[9],
+        ClientStorageOp::TakeTls13Ticket(_, true)
+    ));
+
+    // but ends up with TLS1.2
+    assert_eq!(
+        client_2.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_2)
+    );
 }
 
 #[test]
@@ -4034,7 +4443,7 @@ fn test_acceptor() {
     use rustls::server::Acceptor;
 
     let client_config = Arc::new(make_client_config(KeyType::Ed25519));
-    let mut client = ClientConnection::new(client_config, dns_name("localhost")).unwrap();
+    let mut client = ClientConnection::new(client_config, server_name("localhost")).unwrap();
     let mut buf = Vec::new();
     client.write_tls(&mut buf).unwrap();
 
@@ -4063,9 +4472,7 @@ fn test_acceptor() {
     );
     assert_eq!(
         acceptor.accept().err(),
-        Some(Error::General(
-            "cannot accept after successful acceptance".into()
-        ))
+        Some(Error::General("Acceptor polled after completion".into()))
     );
 
     let mut acceptor = Acceptor::default();
@@ -4193,4 +4600,214 @@ fn test_no_warning_logging_during_successful_sessions() {
             assert_eq!(c.borrow().debug, 0);
         });
     }
+}
+
+/// Test that secrets can be extracted and used for encryption/decryption.
+#[cfg(feature = "secret_extraction")]
+#[test]
+fn test_secret_extraction_enabled() {
+    // Normally, secret extraction would be used to configure kTLS (TLS offload
+    // to the kernel). We want this test to run on any platform, though, so
+    // instead we just compare secrets for equality.
+
+    // TLS 1.2 and 1.3 have different mechanisms for key exchange and handshake,
+    // and secrets are stored/extracted differently, so we want to test them both.
+    // We support 3 different AEAD algorithms (AES-128-GCM mode, AES-256-GCM, and
+    // Chacha20Poly1305), so that's 2*3 = 6 combinations to test.
+    let kt = KeyType::Rsa;
+    for suite in [
+        rustls::cipher_suite::TLS13_AES_128_GCM_SHA256,
+        rustls::cipher_suite::TLS13_AES_256_GCM_SHA384,
+        rustls::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        rustls::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        rustls::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        rustls::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ] {
+        let version = suite.version();
+        println!("Testing suite {:?}", suite.suite().as_str());
+
+        // Only offer the cipher suite (and protocol version) that we're testing
+        let mut server_config = ServerConfig::builder()
+            .with_cipher_suites(&[suite])
+            .with_safe_default_kx_groups()
+            .with_protocol_versions(&[version])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(kt.get_chain(), kt.get_key())
+            .unwrap();
+        // Opt into secret extraction from both sides
+        server_config.enable_secret_extraction = true;
+        let server_config = Arc::new(server_config);
+
+        let mut client_config = make_client_config(kt);
+        client_config.enable_secret_extraction = true;
+
+        let (mut client, mut server) =
+            make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+
+        do_handshake(&mut client, &mut server);
+
+        // The handshake is finished, we're now able to extract traffic secrets
+        let client_secrets = client.extract_secrets().unwrap();
+        let server_secrets = server.extract_secrets().unwrap();
+
+        // Comparing secrets for equality is something you should never have to
+        // do in production code, so ConnectionTrafficSecrets doesn't implement
+        // PartialEq/Eq on purpose. Instead, we have to get creative.
+        fn explode_secrets(s: &ConnectionTrafficSecrets) -> (&[u8], &[u8], &[u8]) {
+            match s {
+                ConnectionTrafficSecrets::Aes128Gcm { key, salt, iv } => (key, salt, iv),
+                ConnectionTrafficSecrets::Aes256Gcm { key, salt, iv } => (key, salt, iv),
+                ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => (key, &[], iv),
+                _ => panic!("unexpected secret type"),
+            }
+        }
+
+        fn assert_secrets_equal(
+            (l_seq, l_sec): (u64, ConnectionTrafficSecrets),
+            (r_seq, r_sec): (u64, ConnectionTrafficSecrets),
+        ) {
+            assert_eq!(l_seq, r_seq);
+            assert_eq!(explode_secrets(&l_sec), explode_secrets(&r_sec));
+        }
+
+        assert_secrets_equal(client_secrets.tx, server_secrets.rx);
+        assert_secrets_equal(client_secrets.rx, server_secrets.tx);
+    }
+}
+
+/// Test that secrets cannot be extracted unless explicitly enabled, and until
+/// the handshake is done.
+#[cfg(feature = "secret_extraction")]
+#[test]
+fn test_secret_extraction_disabled_or_too_early() {
+    let suite = rustls::cipher_suite::TLS13_AES_128_GCM_SHA256;
+    let kt = KeyType::Rsa;
+
+    for (server_enable, client_enable) in [(true, false), (false, true)] {
+        let mut server_config = ServerConfig::builder()
+            .with_cipher_suites(&[suite])
+            .with_safe_default_kx_groups()
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(kt.get_chain(), kt.get_key())
+            .unwrap();
+        server_config.enable_secret_extraction = server_enable;
+        let server_config = Arc::new(server_config);
+
+        let mut client_config = make_client_config(kt);
+        client_config.enable_secret_extraction = client_enable;
+
+        let client_config = Arc::new(client_config);
+
+        let (client, server) = make_pair_for_arc_configs(&client_config, &server_config);
+
+        assert!(
+            client.extract_secrets().is_err(),
+            "extraction should fail until handshake completes"
+        );
+        assert!(
+            server.extract_secrets().is_err(),
+            "extraction should fail until handshake completes"
+        );
+
+        let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(server_enable, server.extract_secrets().is_ok());
+        assert_eq!(client_enable, client.extract_secrets().is_ok());
+    }
+}
+
+#[test]
+fn test_received_plaintext_backpressure() {
+    let suite = rustls::cipher_suite::TLS13_AES_128_GCM_SHA256;
+    let kt = KeyType::Rsa;
+
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_cipher_suites(&[suite])
+            .with_safe_default_kx_groups()
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(kt.get_chain(), kt.get_key())
+            .unwrap(),
+    );
+
+    let client_config = Arc::new(make_client_config(kt));
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+
+    // Fill the server's received plaintext buffer with 16k bytes
+    let client_buf = [0; 16_385];
+    dbg!(client
+        .writer()
+        .write(&client_buf)
+        .unwrap());
+    let mut network_buf = Vec::with_capacity(32_768);
+    let sent = dbg!(client
+        .write_tls(&mut network_buf)
+        .unwrap());
+    let mut read = 0;
+    while read < sent {
+        let new = dbg!(server
+            .read_tls(&mut &network_buf[read..sent])
+            .unwrap());
+        if new == 4096 {
+            read += new;
+        } else {
+            break;
+        }
+    }
+    server.process_new_packets().unwrap();
+
+    // Send two more bytes from client to server
+    dbg!(client
+        .writer()
+        .write(&client_buf[..2])
+        .unwrap());
+    let sent = dbg!(client
+        .write_tls(&mut network_buf)
+        .unwrap());
+
+    // Get an error because the received plaintext buffer is full
+    assert!(server
+        .read_tls(&mut &network_buf[..sent])
+        .is_err());
+
+    // Read out some of the plaintext
+    server
+        .reader()
+        .read_exact(&mut [0; 2])
+        .unwrap();
+
+    // Now there's room again in the plaintext buffer
+    assert_eq!(
+        server
+            .read_tls(&mut &network_buf[..sent])
+            .unwrap(),
+        24
+    );
+}
+
+#[test]
+fn test_debug_server_name_from_ip() {
+    assert_eq!(
+        format!(
+            "{:?}",
+            rustls::ServerName::IpAddress("127.0.0.1".parse().unwrap())
+        ),
+        "IpAddress(127.0.0.1)"
+    )
+}
+
+#[test]
+fn test_debug_server_name_from_string() {
+    assert_eq!(
+        format!("{:?}", rustls::ServerName::try_from("a.com").unwrap()),
+        "DnsName(\"a.com\")"
+    )
 }
