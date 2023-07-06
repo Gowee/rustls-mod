@@ -164,7 +164,7 @@ impl ClientConnection {
             None,
             None,
             None,
-            None::<fn(&mut Message) -> Option<Vec<ExtensionType>>>,
+            None::<fn(&mut _) -> Option<Vec<_>>>,
         )?;
         inner.common_state.quic.version = quic_version;
         Ok(Self {
