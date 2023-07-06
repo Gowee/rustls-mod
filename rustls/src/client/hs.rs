@@ -201,6 +201,7 @@ struct ExpectServerHello {
     offered_key_share: Option<kx::KeyExchange>,
     suite: Option<SupportedCipherSuite>,
     allowed_unsolicited_extensions: Option<Vec<ExtensionType>>,
+    #[allow(dead_code)] // Only in TLS1.2
     fixed_kxkey: Option<(crate::NamedGroup, ring::agreement::EphemeralPrivateKey)>,
 }
 
